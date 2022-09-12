@@ -20,7 +20,7 @@ void ISR_POST_COMPLETE()
 static void PROC_FAIL_handler(struct k_work *work)
 {
 	/* if have not received kcs and post code, add FRB3 event log. */
-	if ((get_kcs_ok() == false) && (get_4byte_postcode_ok() == false)) {
+	if ((get_kcs_ok() == false)) {
 		common_addsel_msg_t sel_msg;
 		sel_msg.InF_target = BMC_IPMB;
 		sel_msg.sensor_type = IPMI_SENSOR_TYPE_PROCESSOR;
@@ -45,7 +45,6 @@ void ISR_DC_ON()
 {
 	set_DC_status(PWRGD_CPU_LVC3);
 	if (get_DC_status() == true) {
-		reset_pcc_buffer();
 		k_work_schedule(&set_DC_on_5s_work, K_SECONDS(DC_ON_5_SECOND));
 		k_work_schedule(&PROC_FAIL_work, K_SECONDS(PROC_FAIL_START_DELAY_SECOND));
 		if (k_work_cancel_delayable(&set_DC_off_10s_work) != 0) {
@@ -57,7 +56,6 @@ void ISR_DC_ON()
 			printf("[%s] Failed to cancel proc_fail delay work.\n", __func__);
 		}
 		reset_kcs_ok();
-		reset_4byte_postcode_ok();
 
 		k_work_schedule(&set_DC_off_10s_work, K_SECONDS(DC_OFF_10_SECOND));
 

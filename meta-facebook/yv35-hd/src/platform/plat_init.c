@@ -19,7 +19,6 @@ void pal_pre_init()
 {
 	init_platform_config();
 	scu_init(scu_cfg, sizeof(scu_cfg) / sizeof(SCU_CFG));
-	pcc_init();
 	apml_init();
 }
 
