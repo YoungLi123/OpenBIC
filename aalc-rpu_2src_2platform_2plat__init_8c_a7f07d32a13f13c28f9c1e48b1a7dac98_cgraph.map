@@ -1,0 +1,9 @@
+<map id="pal_post_init" name="pal_post_init">
+<area shape="rect" id="node1" title=" " alt="" coords="5,130,100,157"/>
+<area shape="rect" id="node2" href="$plat__modbus_8c.html#a2bbc1bf9ee97ea2bbb8831fb1959e5ff" title=" " alt="" coords="155,5,297,47"/>
+<area shape="rect" id="node3" href="$plat__log_8c.html#a2453aa56476ef2a698940c4774b6b268" title=" " alt="" coords="154,71,298,98"/>
+<area shape="rect" id="node4" href="$plat__modbus_8c.html#a59bccb3169e32ad930d5f297c54d22bd" title=" " alt="" coords="148,123,304,164"/>
+<area shape="rect" id="node5" href="$plat__pwm_8c.html#a197d90dab0965102ec73b65bfa58c604" title=" " alt="" coords="175,189,277,215"/>
+<area shape="rect" id="node6" href="$aalc-rpu_2src_2platform_2plat__util_8c.html#aee582fc72927dd4bded64d275ed921c2" title=" " alt="" coords="175,239,277,266"/>
+<area shape="rect" id="node7" href="$hal__gpio_8c.html#ab1b576cbfd9eddaaf57a5aa5fc383dd1" title=" " alt="" coords="352,239,423,266"/>
+</map>
