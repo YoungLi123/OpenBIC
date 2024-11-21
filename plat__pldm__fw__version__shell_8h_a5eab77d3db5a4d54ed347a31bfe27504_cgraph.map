@@ -1,0 +1,14 @@
+<map id="cmd_get_fw_version_vr" name="cmd_get_fw_version_vr">
+<area shape="rect" id="node1" title=" " alt="" coords="5,275,165,301"/>
+<area shape="rect" id="node2" href="$sensor_8c.html#a254481b5d30d7b182e368c57ff208184" title=" " alt="" coords="249,5,385,32"/>
+<area shape="rect" id="node3" href="$sensor_8c.html#a943433215e208bf552a04105d8d7b320" title=" " alt="" coords="250,56,383,83"/>
+<area shape="rect" id="node4" href="$minerva-ag_2src_2platform_2plat__pldm__fw__update_8c.html#a7e86429b39139c1ae6cea5e277f6488f" title=" " alt="" coords="220,107,413,149"/>
+<area shape="rect" id="node5" href="$minerva-ag_2src_2platform_2plat__pldm__sensor_8c.html#a2014dc9a5c208b914abb3230809199d1" title=" " alt="" coords="213,173,420,214"/>
+<area shape="rect" id="node7" href="$minerva-ag_2src_2platform_2plat__pldm__fw__update_8c.html#a3a405c6667db14e2661d96ae25af3691" title=" " alt="" coords="225,238,409,279"/>
+<area shape="rect" id="node8" href="$gt-cc_2src_2platform_2plat__class_8c.html#ac47c03a45a44ebb43a20b6a0db9c639b" title=" " alt="" coords="272,304,361,331"/>
+<area shape="rect" id="node9" href="$mp2891_8c.html#a928b8828b2282c2e56aa2eb140be72b4" title=" " alt="" coords="235,355,398,381"/>
+<area shape="rect" id="node10" href="$mp2971_8c.html#a796944da880207a5a27efca286441a77" title=" " alt="" coords="237,405,397,432"/>
+<area shape="rect" id="node11" href="$raa229621_8c.html#ad0d6c7d452492a49738c3b61a82b9867" title=" " alt="" coords="251,456,383,483"/>
+<area shape="rect" id="node12" href="$raa229621_8c.html#ab627cca97782c32aed2f25487d72c841" title=" " alt="" coords="221,507,412,533"/>
+<area shape="rect" id="node6" href="$minerva-ag_2src_2platform_2plat__pldm__sensor_8c.html#a18272dc8dce4f373b85555817c2cc6f3" title=" " alt="" coords="468,173,617,214"/>
+</map>
