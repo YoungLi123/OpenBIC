@@ -23,6 +23,7 @@
 #define PROJECT_NAME "Sentinel Dome"
 #define PROJECT_STAGE MP
 
+
 /*
  * 0x01 motherboard
  * 0x02 baseboard
