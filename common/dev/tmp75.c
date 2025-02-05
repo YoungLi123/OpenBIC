@@ -21,6 +21,7 @@
 #include <logging/log.h>
 #include "tmp75.h"
 
+
 LOG_MODULE_REGISTER(tmp75);
 
 bool get_tmp75_two_byte_limit(sensor_cfg *cfg, uint8_t temp_threshold_index,
