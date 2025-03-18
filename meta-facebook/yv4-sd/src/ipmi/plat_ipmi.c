@@ -416,26 +416,37 @@ void OEM_1S_WRITE_READ_DIMM(ipmi_msg *msg)
 		return;
 	}
 
+	I2C_MSG i2c_msg = { 0 };
+	memset(&i2c_msg, 0, sizeof(I2C_MSG));
+	i2c_msg.bus = 12;
+	i2c_msg.tx_len = msg->data_len - 3;;
+	i2c_msg.rx_len = msg->data[2];
+
+	/*
 	I3C_MSG i3c_msg = { 0 };
 	i3c_msg.bus = I3C_BUS3;
 	i3c_msg.tx_len = msg->data_len - 3;
 	i3c_msg.rx_len = msg->data[2];
+	*/
 	// Check offset byte count: SPD_NVM has 2 bytes offset
 	if (device_type == DIMM_SPD_NVM) {
-		if (i3c_msg.tx_len < 2) {
+		//if (i3c_msg.tx_len < 2) {
+		if (i2c_msg.tx_len < 2) {
 			msg->completion_code = CC_INVALID_DATA_FIELD;
 			return;
 		}
 	} else {
 		// One byte offset
-		if (i3c_msg.tx_len < 1) {
+		//if (i3c_msg.tx_len < 1) {
+		if (i2c_msg.tx_len < 1) {
 			msg->completion_code = CC_INVALID_DATA_FIELD;
 			return;
 		}
 	}
 
-	memcpy(&i3c_msg.data[0], &msg->data[3], i3c_msg.tx_len);
-	msg->data_len = i3c_msg.rx_len;
+	//memcpy(&i3c_msg.data[0], &msg->data[3], i3c_msg.tx_len);
+	memcpy(&i2c_msg.data[0], &msg->data[3], i2c_msg.tx_len);
+	msg->data_len = i2c_msg.rx_len;
 	if (k_mutex_lock(&i3c_dimm_mutex, K_MSEC(I3C_DIMM_MUTEX_TIMEOUT_MS))) {
 		LOG_ERR("Failed to lock I3C dimm mux");
 		msg->completion_code = CC_NODE_BUSY;
@@ -452,6 +463,8 @@ void OEM_1S_WRITE_READ_DIMM(ipmi_msg *msg)
 	switch (device_type) {
 	case DIMM_SPD:
 	case DIMM_SPD_NVM:
+		/*
+		i2c_msg.target_addr = spd_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
 		i3c_msg.target_addr = spd_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
 		i3c_attach(&i3c_msg);
 		ret = all_brocast_ccc(&i3c_msg);
@@ -477,8 +490,12 @@ void OEM_1S_WRITE_READ_DIMM(ipmi_msg *msg)
 			msg->data_len = i3c_msg.rx_len;
 			msg->completion_code = CC_SUCCESS;
 		}
+		*/
+		msg->completion_code = CC_UNSPECIFIED_ERROR;
 		break;
 	case DIMM_PMIC:
+		i2c_msg.target_addr = pmic_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
+		/*
 		i3c_msg.target_addr = pmic_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
 		i3c_attach(&i3c_msg);
 		ret = all_brocast_ccc(&i3c_msg);
@@ -488,7 +505,20 @@ void OEM_1S_WRITE_READ_DIMM(ipmi_msg *msg)
 			msg->completion_code = CC_UNSPECIFIED_ERROR;
 			goto exit;
 		}
+		*/
 
+
+		ret = i2c_master_read(&i2c_msg, 3);
+		if (ret != 0) {
+			LOG_ERR("Failed to read PMIC addr0x%x offset0x%x, ret%d bus%d",
+				i2c_msg.target_addr, i2c_msg.data[0], ret, i2c_msg.bus);
+			msg->completion_code = CC_UNSPECIFIED_ERROR;
+		} else {
+			memcpy(&msg->data[0], &i2c_msg.data, i2c_msg.rx_len);
+			msg->data_len = i2c_msg.rx_len;
+			msg->completion_code = CC_SUCCESS;
+		}
+		/*
 		ret = i3c_transfer(&i3c_msg);
 		if (ret != 0) {
 			LOG_ERR("Failed to read PMIC addr0x%x offset0x%x, ret%d bus%d",
@@ -499,16 +529,18 @@ void OEM_1S_WRITE_READ_DIMM(ipmi_msg *msg)
 			msg->data_len = i3c_msg.rx_len;
 			msg->completion_code = CC_SUCCESS;
 		}
+		*/
 		break;
 	default:
 		msg->completion_code = CC_INVALID_DATA_FIELD;
 		break;
 	}
 exit:
-	i3c_detach(&i3c_msg);
+	//i3c_detach(&i3c_msg);
 	// Switch I3C MUX to CPU after read finish
 	switch_i3c_dimm_mux(I3C_MUX_CPU_TO_DIMM);
 	if (k_mutex_unlock(&i3c_dimm_mutex)) {
 		LOG_ERR("Failed to lock I3C dimm MUX");
 	}
+
 }

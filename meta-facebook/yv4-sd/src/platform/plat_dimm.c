@@ -58,8 +58,7 @@ void start_get_dimm_info_thread()
 
 void get_dimm_info_handler()
 {
-	I3C_MSG i3c_msg = { 0 };
-	i3c_msg.bus = I3C_BUS3;
+	I2C_MSG msg = {0};
 
 	// Init mutex
 	if (k_mutex_init(&i3c_dimm_mutex)) {
@@ -158,6 +157,36 @@ void get_dimm_info_handler()
 				break;
 			}
 
+			memset(&msg, 0, sizeof(I2C_MSG));
+			msg.bus = 12;
+			msg.target_addr = spd_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
+			msg.tx_len = 1;
+			msg.rx_len = MAX_LEN_I3C_GET_SPD_TEMP;
+			msg.data[0] = DIMM_SPD_TEMP;
+
+			if (i2c_master_read(&msg, 3)) {
+				LOG_ERR("Failed to read DIMM %d SPD temperature", dimm_id);
+			} else {
+				memcpy(&dimm_data[dimm_id].spd_temp_data, &msg.data,
+				       sizeof(dimm_data[dimm_id].spd_temp_data));
+			}
+
+			memset(&msg, 0, sizeof(I2C_MSG));
+			msg.bus = 12;
+			msg.target_addr = pmic_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
+			msg.tx_len = 1;
+			msg.rx_len = MAX_LEN_I3C_GET_PMIC_PWR;
+			msg.data[0] = DIMM_PMIC_SWA_PWR;
+
+			if (i2c_master_read(&msg, 3)) {
+				LOG_ERR("Failed to read DIMM %d SPD pwr", dimm_id);
+				continue;
+			} else {
+				memcpy(&dimm_data[dimm_id].pmic_pwr_data, &msg.data,
+				       sizeof(dimm_data[dimm_id].pmic_pwr_data));
+			}
+
+			/*
 			memset(&i3c_msg, 0, sizeof(I3C_MSG));
 			i3c_msg.bus = I3C_BUS3;
 			i3c_msg.target_addr = spd_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
@@ -226,6 +255,7 @@ void get_dimm_info_handler()
 				       sizeof(dimm_data[dimm_id].pmic_pwr_data));
 			}
 			i3c_detach(&i3c_msg);
+			*/
 		}
 
 		if (k_mutex_unlock(&i3c_dimm_mutex)) {
@@ -427,7 +457,8 @@ int all_brocast_ccc(I3C_MSG *i3c_msg)
 
 int init_dimm_prsnt_status()
 {
-	I3C_MSG i3c_msg = { 0 };
+	I2C_MSG msg = { 0 };
+	//I3C_MSG i3c_msg = { 0 };
 	int ret = 0;
 
 	// Clear DIMM data
@@ -452,6 +483,23 @@ int init_dimm_prsnt_status()
 			continue;
 		}
 
+		memset(&msg, 0, sizeof(I2C_MSG));
+		msg.bus = 12;
+		msg.target_addr = spd_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
+		msg.tx_len = 1;
+		msg.rx_len = 1;
+		msg.data[0] = 0x00;
+
+		if (i2c_master_read(&msg, 3)) {
+			clear_unaccessible_dimm_data(dimm_id);
+			LOG_INF("[%s]DIMM ID 0x%02x is not present", __func__, dimm_id);
+			dimm_data[dimm_id].is_present = DIMM_NOT_PRSNT;
+		} else {
+			LOG_DBG("[%s]DIMM ID 0x%02x is present", __func__, dimm_id);
+			dimm_data[dimm_id].is_present = DIMM_PRSNT;
+		}
+
+		/*
 		i3c_msg.bus = I3C_BUS3;
 		i3c_msg.target_addr = spd_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
 		i3c_attach(&i3c_msg);
@@ -480,6 +528,7 @@ int init_dimm_prsnt_status()
 			dimm_data[dimm_id].is_present = DIMM_PRSNT;
 		}
 		i3c_detach(&i3c_msg);
+		*/
 	}
 
 	if (k_mutex_unlock(&i3c_dimm_mutex)) {

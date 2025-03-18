@@ -32,6 +32,7 @@
 #include "pldm_monitor.h"
 #include "oem_1s_handler.h"
 #include "util_worker.h"
+#include "plat_gpio.h"
 
 LOG_MODULE_REGISTER(plat_pmic);
 
@@ -262,6 +263,7 @@ int compare_pmic_error(uint8_t dimm_id, uint8_t *pmic_err_data, uint8_t pmic_err
 		if (reg_index == MAX_COUNT_PMIC_ERROR_OFFSET) {
 			is_pmic_error_match = true;
 			if (is_pmic_error_flag[dimm_id][err_index] == false) {
+				gpio_set(BIC_READY_R, 0);
 				add_pmic_error_sel(dimm_id, err_index);
 				is_pmic_error_flag[dimm_id][err_index] = true;
 			}
@@ -310,7 +312,8 @@ int pal_set_pmic_error_flag(uint8_t dimm_id, uint8_t error_type)
 int get_pmic_error_data_one(uint8_t dimm_id, uint8_t *buffer, uint8_t is_need_check_post_status)
 {
 	CHECK_NULL_ARG_WITH_RETURN(buffer, -1);
-	I3C_MSG i3c_msg = { 0 };
+	//I3C_MSG i3c_msg = { 0 };
+	I2C_MSG msg = { 0 };
 	int ret = 0;
 
 	if (get_dimm_present(dimm_id) == DIMM_NOT_PRSNT) {
@@ -329,6 +332,21 @@ int get_pmic_error_data_one(uint8_t dimm_id, uint8_t *buffer, uint8_t is_need_ch
 		return -1;
 	}
 
+	memset(&msg, 0, sizeof(I2C_MSG));
+	msg.bus = 12;
+	msg.target_addr = pmic_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
+	for (int i = 0; i < MAX_COUNT_PMIC_ERROR_OFFSET; i++) {
+		msg.tx_len = 1;
+		msg.rx_len = 1;
+		msg.data[0] = pmic_i3c_err_offset[i];
+		ret = i2c_master_read(&msg, 3);
+		if (ret != 0) {
+			LOG_ERR("Failed to read PMIC error %d", dimm_id);
+		}
+		buffer[pmic_i3c_err_data_index[i]] = msg.data[0];
+	}
+
+	/*
 	i3c_msg.bus = I3C_BUS3;
 	i3c_msg.target_addr = pmic_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
 
@@ -356,6 +374,7 @@ int get_pmic_error_data_one(uint8_t dimm_id, uint8_t *buffer, uint8_t is_need_ch
 	}
 
 	i3c_detach(&i3c_msg);
+	*/
 
 	return ret;
 }
@@ -364,7 +383,8 @@ int get_pmic_error_data(uint8_t dimm_id, uint8_t *buffer, uint8_t is_need_check_
 {
 	CHECK_NULL_ARG_WITH_RETURN(buffer, -1);
 	int ret = 0;
-	I3C_MSG i3c_msg = { 0 };
+	//I3C_MSG i3c_msg = { 0 };
+	I2C_MSG msg = { 0 };
 
 	if (get_dimm_present(dimm_id) == DIMM_NOT_PRSNT) {
 		return -1;
@@ -382,6 +402,20 @@ int get_pmic_error_data(uint8_t dimm_id, uint8_t *buffer, uint8_t is_need_check_
 		return -1;
 	}
 
+	memset(&msg, 0, sizeof(I2C_MSG));
+	msg.bus = 12;
+	msg.target_addr = pmic_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
+	msg.tx_len = 1;
+	msg.rx_len = MAX_LEN_I3C_GET_PMIC_ERR;
+	msg.data[0] = 5;
+	ret = i2c_master_read(&msg, 3);
+
+	if (ret != 0) {
+		LOG_ERR("Failed to read PMIC error %d", dimm_id);
+	}
+	memcpy(buffer, msg.data, msg.rx_len);
+
+	/*
 	i3c_msg.bus = I3C_BUS3;
 	i3c_msg.target_addr = pmic_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
 
@@ -405,6 +439,7 @@ int get_pmic_error_data(uint8_t dimm_id, uint8_t *buffer, uint8_t is_need_check_
 	}
 
 	memcpy(buffer, i3c_msg.data, i3c_msg.rx_len);
+	*/
 	return ret;
 }
 
@@ -449,8 +484,11 @@ void read_pmic_error_when_dc_off()
 
 void clear_pmic_error(uint8_t dimm_id)
 {
+	LOG_INF("s c pmic error");
+
 	int ret = 0;
-	I3C_MSG i3c_msg = { 0 };
+	//I3C_MSG i3c_msg = { 0 };
+	uint8_t retry = 3;
 
 	if (k_mutex_lock(&i3c_dimm_mutex, K_MSEC(I3C_DIMM_MUTEX_TIMEOUT_MS))) {
 		LOG_ERR("Failed to lock I3C dimm MUX");
@@ -466,6 +504,79 @@ void clear_pmic_error(uint8_t dimm_id)
 		return;
 	}
 
+	I2C_MSG *msg = (I2C_MSG *)malloc(sizeof(I2C_MSG));
+
+	/* Set R35 to clear error injection */
+	memset(msg, 0, sizeof(*msg));
+	msg->bus = 12;
+	msg->target_addr = pmic_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
+	msg->tx_len = 2;
+	msg->rx_len = 1;
+	msg->data[0] = 0x35;
+	msg->data[1] = 0x00;
+
+	if (i2c_master_write(msg, retry)) {
+		LOG_ERR("Failed to set PMIC R35 to 0x00.");
+	}
+
+	if (is_critical_error(dimm_id)) {
+		uint8_t i = 0;
+		for (; i < CLEAR_MTP_RETRY_MAX; i++) {
+			/* Set R39 to clear MTP and R04-R07 */
+			memset(msg, 0, sizeof(*msg));
+			msg->bus = 12;
+			msg->target_addr = pmic_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
+			msg->tx_len = 2;
+			msg->data[0] = 0x39;
+			msg->data[1] = 0x74;
+
+			if (i2c_master_write(msg, retry)) {
+				LOG_ERR("Failed to set PMIC R39 to 0x74.");
+				continue;
+			}
+
+			k_msleep(100);
+
+			memset(msg, 0, sizeof(*msg));
+			msg->bus = 12;
+			msg->target_addr = pmic_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
+			msg->tx_len = 1;
+			msg->rx_len = 4;
+			msg->data[0] = 0x04;
+
+			if (i2c_master_read(msg, retry)) {
+				LOG_ERR("Failed to read PMIC R39.");
+				continue;
+			}
+
+			if (!(msg->data[0] || msg->data[1] || msg->data[2] || msg->data[3])) {
+				break;
+			}
+		}
+
+		if (i == CLEAR_MTP_RETRY_MAX) {
+			LOG_ERR("Failed to clear MTP, retry reach max.");
+		}
+	}
+
+	/* Set R14 to clear R08-R0B, R33 */
+	memset(msg, 0, sizeof(*msg));
+	msg->bus = 12;
+	msg->target_addr = pmic_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
+	msg->tx_len = 2;
+	msg->data[0] = 0x14;
+	msg->data[1] = 0x01;
+
+	if (i2c_master_write(msg, retry)) {
+		LOG_ERR("Failed to set PMIC R14 to 0x01.");
+	}
+
+	if (k_mutex_unlock(&i3c_dimm_mutex)) {
+		LOG_ERR("Failed to unlock I3C dimm MUX");
+	}
+	SAFE_FREE(msg);
+
+/*
 	i3c_msg.bus = I3C_BUS3;
 	i3c_msg.target_addr = pmic_i3c_addr_list[dimm_id % (DIMM_ID_MAX / 2)];
 
@@ -475,7 +586,9 @@ void clear_pmic_error(uint8_t dimm_id)
 	i3c_msg.rx_len = 1;
 
 	memset(&i3c_msg.data, 0, 2);
+*/
 	/* Set R35 to clear error injection */
+/*
 	i3c_msg.data[0] = PMIC_CLEAR_ERROR_INJECTION_CFG_OFFSET;
 	i3c_msg.data[1] = 0x00;
 	ret = i3c_transfer(&i3c_msg);
@@ -542,5 +655,6 @@ void clear_pmic_error(uint8_t dimm_id)
 	if (k_mutex_unlock(&i3c_dimm_mutex)) {
 		LOG_ERR("Failed to unlock I3C dimm MUX");
 	}
+*/
 	return;
 }
