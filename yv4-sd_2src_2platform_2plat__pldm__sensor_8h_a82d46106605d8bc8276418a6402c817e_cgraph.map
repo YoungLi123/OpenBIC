@@ -1,0 +1,7 @@
+<map id="bootdrive_access" name="bootdrive_access">
+<area shape="rect" id="node1" title=" " alt="" coords="5,31,129,57"/>
+<area shape="rect" id="node2" href="$hal__i2c_8c.html#a10a12888a55c2d866fcf01cbd342652f" title=" " alt="" coords="177,5,296,32"/>
+<area shape="rect" id="node4" href="$sensor_8c.html#ace549a8d09f5eb7f21890a4d072c8919" title=" " alt="" coords="189,56,285,83"/>
+<area shape="rect" id="node3" href="$hal__i2c_8c.html#abe0116512c803f4b7188c17345eb998f" title=" " alt="" coords="344,5,487,32"/>
+<area shape="rect" id="node5" href="$power__status_8c.html#abeff55e3cd2e8563760154b81f37f286" title=" " alt="" coords="358,56,473,83"/>
+</map>
