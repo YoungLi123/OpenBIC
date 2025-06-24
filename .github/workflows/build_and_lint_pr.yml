@@ -115,9 +115,9 @@ jobs:
       run: |
         prjname=${{ matrix.platform }}
         if [[ $prjname == nuvoton* ]]; then
-          west -z zephyr_nuvoton build -p auto -b npcm400f_evb openbic/meta-facebook/${prjname#nuvoton-}/
+          west -z zephyr_nuvoton build -p auto -b npcm400f_evb ${{ github.event.repository.name }}/meta-facebook/${prjname#nuvoton-}/
         else
-          west build -p auto -b ast1030_evb openbic/meta-facebook/${{ matrix.platform }}/
+          west build -p auto -b ast1030_evb ${{ github.event.repository.name }}/meta-facebook/${{ matrix.platform }}/
         fi
 
     - name: Get Build Status
