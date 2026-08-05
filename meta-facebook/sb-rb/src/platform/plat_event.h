@@ -13,3 +13,50 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#ifndef PLAT_EVENT_H
+#define PLAT_EVENT_H
+#include <stdbool.h>
+#include <stdint.h>
+#include "plat_cpld.h"
+
+#define HAMSA_SMB_ERR_EVENT_HEADER 0x60
+#define BOOTSTRAP_SET_AFTER_PWR_EN 0x54
+#define HAMSA_MFIO22_ERR_EVENT 0x55
+#define MEDHA0_MFIO24_ERR_EVENT 0x56
+#define MEDHA1_MFIO24_ERR_EVENT 0x57
+#define HAMSA_MFIO23_ERR_EVENT 0x58
+#define MEDHA0_MFIO31_ERR_EVENT 0x59
+#define MEDHA1_MFIO31_ERR_EVENT 0x5A
+
+#define ASIC_MONITOR_TEMP_REG 0x70
+#define ASIC_MONITOR_TEMP_REG_LEN 10
+
+typedef struct _vr_fault_info {
+	uint8_t mtia_event_source;
+	uint8_t cpld_reg_offset;
+	uint8_t cpld_reg_bit;
+	bool is_pmbus_vr;
+	uint8_t rail_id;
+} vr_fault_info;
+
+enum event_type {
+	VR_POWER_FAULT = 0x01,
+	ASIC_MODULE_ERROR = 0x29,
+};
+
+typedef struct __attribute__((packed)) _plat_asic_error_event {
+	uint8_t event_id_0;
+	uint8_t event_id_1;
+	uint8_t chip_id;
+	uint8_t module_id;
+} plat_asic_error_event;
+
+void process_mtia_vr_power_fault_sel(cpld_info *cpld_info, uint8_t *current_cpld_value);
+void plat_set_ac_on_log();
+void plat_set_dc_on_log(bool is_assert);
+void plat_set_iris_temp_error_log(bool is_assert, uint8_t sensor_id);
+void asic_thermtrip_error_log(bool is_assert);
+void plat_asic_error_error_log(bool is_assert, plat_asic_error_event event);
+plat_asic_error_event *plat_get_asic_error_event();
+int read_asic_reg(uint8_t reg, uint8_t *data, uint8_t len);
+#endif

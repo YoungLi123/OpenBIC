@@ -23,6 +23,8 @@
 #include "plat_kcs.h"
 #include "plat_pmic.h"
 #include "util_worker.h"
+#include "plat_isr.h"
+#include "plat_dimm.h"
 
 SCU_CFG scu_cfg[] = {
 	//register    value
@@ -31,7 +33,7 @@ SCU_CFG scu_cfg[] = {
 	{ 0x7e6e2618, 0x30000000 },
 	{ 0x7e6e261c, 0x00000F04 },
 	// If not rework host console route uart1(HOST) <-> uart2, need to enable dts uart2 and plat_init.c need to setup register offset: 0x7e78909c to value: 0x00190021
-	
+
 };
 
 void pal_pre_init()
@@ -39,6 +41,7 @@ void pal_pre_init()
 	init_platform_config();
 	disable_PRDY_interrupt();
 	scu_init(scu_cfg, sizeof(scu_cfg) / sizeof(SCU_CFG));
+	init_vr_event_work();
 	init_plat_worker(CONFIG_MAIN_THREAD_PRIORITY + 1); // work queue for low priority jobs
 }
 
@@ -50,7 +53,7 @@ void pal_post_init()
 void pal_device_init()
 {
 	init_me_firmware();
-
+	init_i3c_dimm();
 	start_monitor_pmic_error_thread();
 }
 
@@ -61,6 +64,7 @@ void pal_set_sys_status()
 	set_post_status(FM_BIOS_POST_CMPLT_BMC_N);
 	set_CPU_power_status(PWRGD_CPU_LVC3);
 	set_post_thread();
+	set_bootdrive_exist_status();
 	set_sys_ready_pin(BIC_READY);
 }
 

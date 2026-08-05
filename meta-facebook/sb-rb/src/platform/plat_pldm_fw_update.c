@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <logging/log.h>
+#include <sys/crc.h>
 
 #include "pldm_firmware_update.h"
 #include "plat_pldm_fw_update.h"
@@ -27,13 +28,35 @@
 #include "mp2971.h"
 #include "mp29816a.h"
 #include "raa228249.h"
+#include "drivers/i2c_npcm4xx.h"
+#include "util_spi.h"
+#include "plat_gpio.h"
+#include "plat_cpld.h"
+#include "plat_iris_smbus.h"
+#include "plat_util.h"
+#include "plat_i2c.h"
+#include "shell_iris_power.h"
+
+#define IRIS_BOOT0_IMG_SIZE 0x1FFFFB
+#define PLAT_WAIT_SENSOR_POLLING_END_DELAY_MS 1000
 
 LOG_MODULE_REGISTER(plat_fwupdate);
 
 static uint8_t pldm_pre_vr_update(void *fw_update_param);
 static uint8_t pldm_post_vr_update(void *fw_update_param);
+static uint8_t plat_pldm_vr_update(void *fw_update_param);
+static uint8_t pldm_pre_bic_update(void *fw_update_param);
 static bool get_vr_fw_version(void *info_p, uint8_t *buf, uint8_t *len);
+static bool get_boot0_hamsa_fw_version(void *info_p, uint8_t *buf, uint8_t *len);
+static bool get_boot0_medha0_fw_version(void *info_p, uint8_t *buf, uint8_t *len);
+static bool get_boot0_medha1_fw_version(void *info_p, uint8_t *buf, uint8_t *len);
 
+static uint32_t crc_boot0[BOOT0_MAX] = { 0 };
+static uint32_t version_boot0[BOOT0_MAX] = { 0 };
+const struct device *i2c_dev;
+uint8_t slave_id = HAMSA_BOOT1_ADDR;
+static uint32_t write_addr = HAMSA_BOOT1_ASIC_MEM_ADDR;
+bool update_flag = 0;
 typedef struct {
 	uint8_t firmware_comp_id;
 	uint8_t plat_pldm_sensor_id;
@@ -54,23 +77,551 @@ compnt_mapping_sensor vr_compnt_mapping_sensor_table[] = {
 	{ COMPNT_VR_10, SENSOR_NUM_ASIC_P0V4_VDDQL_HBM0246_TEMP_C, "ASIC_P0V4_VDDQL_HBM0246" },
 	{ COMPNT_VR_11, SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_TEMP_C, "ASIC_P0V75_OWL_W_VDD" },
 	{ COMPNT_VR_12, SENSOR_NUM_ASIC_P0V9_OWL_W_TRVDD_TEMP_C, "ASIC_P0V9_OWL_W_TRVDD" },
+	{ COMPNT_VR_3V3, SENSOR_NUM_P3V3_OSFP_TEMP_C, "P3V3_OSFP" },
 };
+static uint8_t pldm_pre_bic_update(void *fw_update_param)
+{
+	ARG_UNUSED(fw_update_param);
 
-// clang-format off
+	/* Stop sensor polling */
+	set_plat_sensor_polling_enable_flag(false);
+	LOG_INF("Stop pldm sensor polling");
+	return 0;
+}
+void spi_node_disable()
+{
+	gpio_set(SPI_HAMSA_MUX_IN1, 0);
+	gpio_set(SPI_MEDHA0_MUX_IN1, 0);
+	gpio_set(SPI_MEDHA1_MUX_IN1, 0);
+	gpio_set(QSPI_CPLD_SEL_0, 0);
+	gpio_set(QSPI_CPLD_SEL_1, 0);
+}
+
+void change_spi_node_to_hamsa()
+{
+	gpio_set(SPI_HAMSA_MUX_IN1, 1);
+	gpio_set(QSPI_CPLD_SEL_0, 0);
+	gpio_set(QSPI_CPLD_SEL_1, 0);
+}
+
+void change_spi_node_to_medha0()
+{
+	gpio_set(SPI_MEDHA0_MUX_IN1, 1);
+	gpio_set(QSPI_CPLD_SEL_0, 1);
+	gpio_set(QSPI_CPLD_SEL_1, 0);
+}
+
+void change_spi_node_to_medha1()
+{
+	gpio_set(SPI_MEDHA1_MUX_IN1, 1);
+	gpio_set(QSPI_CPLD_SEL_0, 0);
+	gpio_set(QSPI_CPLD_SEL_1, 1);
+}
+
+void plat_set_cpld_reset_reg(uint8_t value)
+{
+	plat_write_cpld(RESET, &value);
+}
+
+static uint8_t pldm_pre_mtia_flash_update(void *fw_update_param)
+{
+	CHECK_NULL_ARG_WITH_RETURN(fw_update_param, 1);
+
+	pldm_fw_update_param_t *p = (pldm_fw_update_param_t *)fw_update_param;
+	plat_set_cpld_reset_reg(RESET_CPLD_OFF);
+	uint16_t spi_node = p->comp_id;
+	// LOG_DBG("MTIA flash comp id: 0x%x", p->comp_id);
+	switch (spi_node) {
+	case COMPNT_HAMSA:
+		change_spi_node_to_hamsa();
+		LOG_INF("change spi node to hamsa");
+		break;
+	case COMPNT_MEDHA0:
+		change_spi_node_to_medha0();
+		LOG_INF("change spi node to medha0");
+		break;
+	case COMPNT_MEDHA1:
+		change_spi_node_to_medha1();
+		LOG_INF("change spi node to medha1");
+		break;
+	default:
+		LOG_ERR("Unsupported MTIA flash comp id: 0x%x", p->comp_id);
+		plat_set_cpld_reset_reg(RESET_CPLD_ON);
+		return 1;
+	}
+
+	// re-init flash
+	const struct device *flash_dev;
+	flash_dev = device_get_binding("spi_fiu0_cs1");
+	int rc = 0;
+	rc = spi_nor_re_init(flash_dev);
+	if (rc != 0) {
+		LOG_ERR("spi_nor_re_init fail");
+		plat_set_cpld_reset_reg(RESET_CPLD_ON);
+		return 1;
+	}
+
+	return 0;
+}
+
+uint8_t pldm_mtia_flash_update(void *fw_update_param)
+{
+	CHECK_NULL_ARG_WITH_RETURN(fw_update_param, 1);
+
+	return pldm_fw_update(fw_update_param, DEVSPI_SPI1_CS1);
+}
+
+uint32_t plat_get_image_version(uint8_t index)
+{
+	if (index >= BOOT0_MAX) {
+		return 0;
+	} else {
+		return version_boot0[index];
+	}
+}
+
+static uint8_t pldm_post_mtia_flash_update(void *fw_update_param)
+{
+	CHECK_NULL_ARG_WITH_RETURN(fw_update_param, 1);
+	const pldm_fw_update_param_t *p = (pldm_fw_update_param_t *)fw_update_param;
+
+	//read data back to calculate CRC32
+	uint8_t *rxbuf = NULL;
+	uint8_t *version_rxbuf = NULL;
+	// image data is from 0x0 to 0x1FFFFB, 0x1FFFFC to 0x1FFFFF is CRC32
+	int remain = IRIS_BOOT0_IMG_SIZE + 1;
+	uint32_t offset = 0;
+	uint32_t crc32 = 0;
+
+	rxbuf = malloc(PLAT_CRC32_READ_SIZE);
+	version_rxbuf = malloc(PLAT_CRC32_READ_SIZE);
+	if (rxbuf == NULL) {
+		LOG_ERR("Fail to allocate size %d", PLAT_CRC32_READ_SIZE);
+	} else {
+		while (remain > 0) {
+			if (remain > PLAT_CRC32_READ_SIZE) {
+				if (read_fw_image(offset, PLAT_CRC32_READ_SIZE, rxbuf,
+						  DEVSPI_SPI1_CS1)) {
+					LOG_ERR("Fail to read offset %x", offset);
+					break;
+				}
+				crc32 = crc32_ieee_update(crc32, rxbuf, PLAT_CRC32_READ_SIZE);
+				remain = remain - PLAT_CRC32_READ_SIZE;
+				offset += PLAT_CRC32_READ_SIZE;
+			} else {
+				if (read_fw_image(offset, remain, rxbuf, DEVSPI_SPI1_CS1)) {
+					LOG_ERR("Fail to read offset %x", offset);
+					break;
+				}
+				crc32 = crc32_ieee_update(crc32, rxbuf, remain);
+				remain = 0;
+				break;
+			}
+		}
+	}
+	SAFE_FREE(rxbuf);
+	if (read_fw_image(0x1FFFF8, 3, version_rxbuf, DEVSPI_SPI1_CS1)) {
+		LOG_ERR("read flash : read_fw_image fail");
+		plat_set_cpld_reset_reg(RESET_CPLD_ON);
+		SAFE_FREE(version_rxbuf);
+		return 1;
+	}
+	uint32_t ver_value = version_rxbuf[0] << 16 | version_rxbuf[1] << 8 | version_rxbuf[2];
+
+	switch (p->comp_id) {
+	case COMPNT_HAMSA:
+		crc_boot0[BOOT0_HAMSA] = crc32;
+		version_boot0[BOOT0_HAMSA] = ver_value;
+		SAFE_FREE(version_rxbuf);
+		break;
+	case COMPNT_MEDHA0:
+		crc_boot0[BOOT0_MEDHA0] = crc32;
+		version_boot0[BOOT0_MEDHA0] = ver_value;
+		SAFE_FREE(version_rxbuf);
+		break;
+	case COMPNT_MEDHA1:
+		crc_boot0[BOOT0_MEDHA1] = crc32;
+		version_boot0[BOOT0_MEDHA1] = ver_value;
+		SAFE_FREE(version_rxbuf);
+		break;
+	default:
+		break;
+	}
+
+	// disable spi node
+	spi_node_disable();
+	LOG_INF("Disable spi node");
+	plat_set_cpld_reset_reg(RESET_CPLD_ON);
+	return 0;
+}
+
+bool plat_get_image_crc_checksum_from_flash(uint8_t index, uint32_t *data_ver, uint32_t *data_crc)
+{
+	CHECK_NULL_ARG_WITH_RETURN(data_ver, false);
+	CHECK_NULL_ARG_WITH_RETURN(data_crc, false);
+
+	if (index != COMPNT_HAMSA && index != COMPNT_MEDHA0 && index != COMPNT_MEDHA1) {
+		return false;
+	}
+	uint8_t flash_index = 0;
+
+	switch (index) {
+	case COMPNT_HAMSA:
+		change_spi_node_to_hamsa();
+		flash_index = BOOT0_HAMSA;
+		break;
+	case COMPNT_MEDHA0:
+		change_spi_node_to_medha0();
+		flash_index = BOOT0_MEDHA0;
+		break;
+	case COMPNT_MEDHA1:
+		change_spi_node_to_medha1();
+		flash_index = BOOT0_MEDHA1;
+		break;
+	default:
+		LOG_ERR("wrong id: 0x%x", index);
+		return false;
+	}
+	// re-init flash
+	const struct device *flash_dev;
+	flash_dev = device_get_binding("spi_fiu0_cs1");
+	if (spi_nor_re_init(flash_dev) != 0) {
+		LOG_ERR("spi_nor_re_init fail");
+		spi_node_disable();
+		return false;
+	}
+
+	/*
+	read data back to combine in Ver and CRC32
+	0x1FFFF8 (Byte 0): VERSION_PATCH = 0x00
+	0x1FFFF9 (Byte 1): VERSION_MINOR  = 0x06
+	0x1FFFFA (Byte 2): VERSION_MAJOR  = 0x01
+
+	0x1FFFFC: CRC32 byte 0 (LSB)
+	0x1FFFFD: CRC32 byte 1
+	0x1FFFFE: CRC32 byte 2
+	0x1FFFFF: CRC32 byte 3 (MSB)
+
+	VER : 01.06.00 | CRC32 : e9e2b0ba
+	*/
+
+	uint8_t rxbuf[8] = { 0 };
+	if (read_fw_image(PLAT_FLASH_BOOT0_VER_OFFSET, 8, rxbuf, DEVSPI_SPI1_CS1)) {
+		LOG_ERR("read_fw_image fail");
+		spi_node_disable();
+		return false;
+	}
+
+	*data_ver = rxbuf[0] << 16 | rxbuf[1] << 8 | rxbuf[2];
+	*data_crc = rxbuf[4] << 24 | rxbuf[5] << 16 | rxbuf[6] << 8 | rxbuf[7];
+	version_boot0[flash_index] = *data_ver;
+	crc_boot0[flash_index] = *data_crc;
+
+	spi_node_disable();
+	return true;
+}
+
+int sb_write_byte(uint8_t cmd, uint8_t data)
+{
+	return i2c_reg_write_byte(i2c_dev, slave_id, cmd, data);
+}
+int smbus_read_byte(uint8_t cmd, uint8_t *data)
+{
+	uint8_t rd;
+	int ret;
+	ret = i2c_write_read(i2c_dev, slave_id, &cmd, 1, &rd, 1);
+	*data = rd;
+
+	return ret;
+}
+static char *prt_mode(uint8_t mode)
+{
+	char *str = NULL;
+
+	switch (mode) {
+	case FASTBOOT_MODE:
+		str = "fastboot";
+		break;
+	case CMRT_SIC_MODE:
+		str = "cmrt_sic";
+		break;
+	case RECOVERY_MODE:
+		str = "recovery";
+		break;
+	default:
+		str = "unknown";
+		break;
+	}
+	return str;
+}
+static int word_to_i2c_pkt(uint8_t *dst, uint32_t src)
+{
+	int data_index = 0;
+
+	/* read the data from specified address */
+	dst[data_index++] = (src >> 0) & BYTE_MASK;
+	dst[data_index++] = (src >> 8) & BYTE_MASK;
+	dst[data_index++] = (src >> 16) & BYTE_MASK;
+	dst[data_index++] = (src >> 24) & BYTE_MASK;
+
+	return data_index;
+}
+int sb_write_block(uint8_t slv_id, uint8_t cmd, uint8_t *data, uint32_t len)
+{
+	//return i2c_burst_write(i2c_dev, slv_id, cmd, data, len);
+	return plat_i2c_write(I2C_BUS12, slave_id, cmd, data, len);
+}
+int sb_read_byte(uint8_t cmd, uint8_t *data)
+{
+	uint8_t rd;
+	int ret;
+	ret = i2c_write_read(i2c_dev, slave_id, &cmd, 1, &rd, 1);
+	*data = rd;
+
+	return ret;
+}
+uint32_t smbus_mode_query(void)
+{
+	uint8_t rd = 0;
+	uint8_t cmd = SB_MODE_QUERY;
+	int err = 0xffff;
+	err = i2c_write_read(i2c_dev, slave_id, &cmd, 1, &rd, 1);
+
+	LOG_INF("slave:0x%x in mode:%d, %s", slave_id, rd, prt_mode(rd));
+
+	return err == 0 ? rd & 0x7 : err;
+}
+int sb_write_fwblock(uint32_t addr, uint32_t *data, uint32_t data_len)
+{
+	//smbus max payload for a transaction is 32
+	uint8_t buf[SMBUS_MAX_PKT_LEN] = { 0 };
+	uint8_t words = 0;
+	buf[MSG_PKT_LEN_OFFSET] = ADDR_DATA_LEN_SZ + data_len;
+	word_to_i2c_pkt(&buf[MSG_ADDR_OFFSET], addr);
+	buf[MSG_DATA_LEN_OFFSET] = data_len;
+
+	// if data length is multples of word size, packetize each word first
+	while (data_len > 0) {
+		word_to_i2c_pkt(&buf[MSG_RDWR_DATA_START + words * BYTES_PER_WORD],
+				*(data + words));
+		data_len -= BYTES_PER_WORD;
+		words++;
+	}
+
+	//bytes to write = total pkt length(buf[0]) + pkt_len_byte_size(1B)
+	return sb_write_block(slave_id, FW_DATA_WRITE, buf,
+			      buf[MSG_PKT_LEN_OFFSET] + PKT_LEN_BYTE_SZ);
+}
+
+int iris_data_write(uint8_t *data, uint32_t data_size)
+{
+	int idx = 0;
+	int err = 0;
+	uint32_t size = data_size;
+	uint32_t dst_addr = HAMSA_BOOT1_ASIC_MEM_ADDR;
+	uint8_t *data_buf = data;
+	uint8_t rd;
+	uint32_t write_size = MAX_DATA_PKT_SIZE;
+	while (size > 0) {
+		int offset = (write_size * idx);
+
+		if (size > MAX_DATA_PKT_SIZE) {
+			write_size = MAX_DATA_PKT_SIZE;
+			size = size - MAX_DATA_PKT_SIZE;
+			idx++;
+		} else {
+			// Last chunk
+			write_size = size;
+			size = 0;
+			idx++;
+		}
+		// if error,  retry up to MAX_RETRIES
+		int tries = MAX_RETRIES;
+		while (tries) {
+			err = sb_write_fwblock(write_addr, (uint32_t *)(data_buf + offset),
+					       write_size);
+			if (err == true)
+				break;
+			tries--;
+			LOG_INF("t%d ", tries);
+		}
+		// if fails after all retries, abort the download cmd
+		if (tries == 0) {
+			LOG_ERR("fw write fail at addr:0x%x,%dB, remaining:%dB", write_addr,
+				write_size, size);
+			LOG_WRN("aborting the firmware download\n");
+			goto err_i2c_write_img;
+		}
+
+		// after first block, ensure fw state is set to progress
+		if (write_addr == dst_addr) {
+			LOG_INF("Verify status progress bit");
+			// If the slave state is not valid, abort download cmd
+			err = sb_read_byte(FW_CTRL_READ, &rd);
+			if (err < 0) {
+				LOG_ERR("status read failed. Abort Download\n");
+				goto err_i2c_write_img;
+			}
+
+			if ((rd & FW_DL_SLV_PROG) == 0) {
+				LOG_ERR("invalid fw status:0x%x\n", rd);
+			} else
+				LOG_INF("fw status set to progress(0x%x)\n", rd);
+		}
+
+		write_addr += write_size;
+	}
+	return 0;
+
+err_i2c_write_img:
+	return 1;
+}
+
+#define ASIC_VERSION_BYTE 0x68
+#define I2C_MAX_RETRY 3
+void get_fw_version_boot0_from_asic()
+{
+	I2C_MSG i2c_msg = { .bus = I2C_BUS12, .target_addr = 0x32 };
+	i2c_msg.tx_len = 1;
+	i2c_msg.rx_len = 10;
+	i2c_msg.data[0] = ASIC_VERSION_BYTE;
+	i2c_master_read_without_error_log(&i2c_msg, I2C_MAX_RETRY);
+
+	uint32_t data_p = i2c_msg.data[8] << 16 | i2c_msg.data[7] << 8 | i2c_msg.data[6];
+	if (data_p) {
+		version_boot0[0] = data_p;
+	}
+	i2c_msg.tx_len = 1;
+	i2c_msg.rx_len = 5;
+	i2c_msg.data[0] = CIP_VERSION_BYTE;
+	i2c_master_read_without_error_log(&i2c_msg, I2C_MAX_RETRY);
+
+	uint32_t data_cip = i2c_msg.data[1] << 16 | i2c_msg.data[2] << 8 | i2c_msg.data[3];
+	if (data_cip) {
+		version_boot0[1] = data_cip;
+		version_boot0[2] = data_cip;
+	}
+}
+uint32_t get_fw_version_boot1_from_asic()
+{
+	I2C_MSG i2c_msg = { .bus = I2C_BUS12, .target_addr = 0x32 };
+	i2c_msg.tx_len = 1;
+	i2c_msg.rx_len = 10;
+	i2c_msg.data[0] = ASIC_VERSION_BYTE;
+	i2c_master_read_without_error_log(&i2c_msg, I2C_MAX_RETRY);
+	uint32_t version = i2c_msg.data[1] << 16 | i2c_msg.data[2] << 8 | i2c_msg.data[3];
+	return version;
+}
+
+static bool get_boot0_hamsa_fw_version(void *info_p, uint8_t *buf, uint8_t *len)
+{
+	CHECK_NULL_ARG_WITH_RETURN(info_p, false);
+	CHECK_NULL_ARG_WITH_RETURN(buf, false);
+	CHECK_NULL_ARG_WITH_RETURN(len, false);
+	get_fw_version_boot0_from_asic();
+	bool ret = false;
+	const char *remain_str_p = "flash hamsa BOOT0: ";
+	uint8_t *buf_p = buf;
+	*len = 0;
+
+	memcpy(buf_p, remain_str_p, strlen(remain_str_p));
+	buf_p += strlen(remain_str_p);
+	*len += strlen(remain_str_p);
+	uint8_t *version = (uint8_t *)&version_boot0[BOOT0_HAMSA];
+	// bin2hex: 3 bytes → 6 charsgit s
+	int hex_len = bin2hex(version, 3, buf_p, 6);
+
+	buf_p += hex_len;
+	*len += hex_len;
+
+	const char *space = " ";
+	memcpy(buf_p, space, strlen(space));
+	buf_p += strlen(space);
+	*len += strlen(space);
+
+	uint8_t *crc_checksum = (uint8_t *)&crc_boot0[BOOT0_HAMSA];
+	int crc_hex_len = bin2hex(crc_checksum, 4, buf_p, 8);
+	buf_p += crc_hex_len;
+	*len += crc_hex_len;
+
+	ret = true;
+	return ret;
+}
+static bool get_boot0_medha0_fw_version(void *info_p, uint8_t *buf, uint8_t *len)
+{
+	CHECK_NULL_ARG_WITH_RETURN(info_p, false);
+	CHECK_NULL_ARG_WITH_RETURN(buf, false);
+	CHECK_NULL_ARG_WITH_RETURN(len, false);
+	// read version from asic first
+	get_fw_version_boot0_from_asic();
+	bool ret = false;
+	const char *remain_str_p = "flash medha0 BOOT0: ";
+	uint8_t *buf_p = buf;
+	*len = 0;
+
+	memcpy(buf_p, remain_str_p, strlen(remain_str_p));
+	buf_p += strlen(remain_str_p);
+	*len += strlen(remain_str_p);
+	uint8_t *version = (uint8_t *)&version_boot0[BOOT0_MEDHA0];
+	// bin2hex: 3 bytes → 6 chars
+	int hex_len = bin2hex(version, 3, buf_p, 6);
+	buf_p += hex_len;
+	*len += hex_len;
+
+	const char *space = " ";
+	memcpy(buf_p, space, strlen(space));
+	buf_p += strlen(space);
+	*len += strlen(space);
+
+	uint8_t *crc_checksum = (uint8_t *)&crc_boot0[BOOT0_MEDHA0];
+	int crc_hex_len = bin2hex(crc_checksum, 4, buf_p, 8);
+	buf_p += crc_hex_len;
+	*len += crc_hex_len;
+
+	ret = true;
+	return ret;
+}
+static bool get_boot0_medha1_fw_version(void *info_p, uint8_t *buf, uint8_t *len)
+{
+	CHECK_NULL_ARG_WITH_RETURN(info_p, false);
+	CHECK_NULL_ARG_WITH_RETURN(buf, false);
+	CHECK_NULL_ARG_WITH_RETURN(len, false);
+	get_fw_version_boot0_from_asic();
+	bool ret = false;
+	const char *remain_str_p = "flash medha1 BOOT0: ";
+	uint8_t *buf_p = buf;
+	*len = 0;
+	memcpy(buf_p, remain_str_p, strlen(remain_str_p));
+	buf_p += strlen(remain_str_p);
+	*len += strlen(remain_str_p);
+	uint8_t *version = (uint8_t *)&version_boot0[BOOT0_MEDHA1];
+	// bin2hex: 3 bytes → 6 chars
+	int hex_len = bin2hex(version, 3, buf_p, 6);
+	buf_p += hex_len;
+	*len += hex_len;
+
+	const char *space = " ";
+	memcpy(buf_p, space, strlen(space));
+	buf_p += strlen(space);
+	*len += strlen(space);
+
+	uint8_t *crc_checksum = (uint8_t *)&crc_boot0[BOOT0_MEDHA1];
+	int crc_hex_len = bin2hex(crc_checksum, 4, buf_p, 8);
+	buf_p += crc_hex_len;
+	*len += crc_hex_len;
+
+	ret = true;
+	return ret;
+}
+//clang-format off
 #define VR_COMPONENT_DEF(comp_id)                                                                  \
 	{                                                                                          \
-		.enable = true,                                                                    \
-		.comp_classification = COMP_CLASS_TYPE_DOWNSTREAM,                                 \
-		.comp_identifier = comp_id,                                                        \
-		.comp_classification_index = 0x00,                                                 \
-		.pre_update_func = pldm_pre_vr_update,                                             \
-		.update_func = pldm_vr_update,                                                     \
-		.pos_update_func = pldm_post_vr_update,                                            \
-		.inf = COMP_UPDATE_VIA_I2C,                                                        \
-		.activate_method = COMP_ACT_AC_PWR_CYCLE,                                          \
-		.self_act_func = NULL,                                                             \
-		.get_fw_version_fn = get_vr_fw_version,                                            \
-		.self_apply_work_func = NULL,                                                      \
+		.enable = true, .comp_classification = COMP_CLASS_TYPE_DOWNSTREAM,                 \
+		.comp_identifier = comp_id, .comp_classification_index = 0x00,                     \
+		.pre_update_func = pldm_pre_vr_update, .update_func = plat_pldm_vr_update,         \
+		.pos_update_func = pldm_post_vr_update, .inf = COMP_UPDATE_VIA_I2C,                \
+		.activate_method = COMP_ACT_AC_PWR_CYCLE, .self_act_func = NULL,                   \
+		.get_fw_version_fn = get_vr_fw_version, .self_apply_work_func = NULL,              \
 		.comp_version_str = NULL,                                                          \
 	}
 // clang-format on
@@ -82,7 +633,7 @@ pldm_fw_update_info_t PLDMUPDATE_FW_CONFIG_TABLE[] = {
 		.comp_classification = COMP_CLASS_TYPE_DOWNSTREAM,
 		.comp_identifier = COMPNT_BIC,
 		.comp_classification_index = 0x00,
-		.pre_update_func = NULL,
+		.pre_update_func = pldm_pre_bic_update,
 		.update_func = pldm_bic_update,
 		.pos_update_func = NULL,
 		.inf = COMP_UPDATE_VIA_SPI,
@@ -104,6 +655,52 @@ pldm_fw_update_info_t PLDMUPDATE_FW_CONFIG_TABLE[] = {
 	VR_COMPONENT_DEF(COMPNT_VR_10),
 	VR_COMPONENT_DEF(COMPNT_VR_11),
 	VR_COMPONENT_DEF(COMPNT_VR_12),
+	{
+		.enable = true,
+		.comp_classification = COMP_CLASS_TYPE_DOWNSTREAM,
+		.comp_identifier = COMPNT_HAMSA,
+		.comp_classification_index = 0x00,
+		.pre_update_func = pldm_pre_mtia_flash_update,
+		.update_func = pldm_mtia_flash_update,
+		.pos_update_func = pldm_post_mtia_flash_update,
+		.inf = COMP_UPDATE_VIA_SPI,
+		.activate_method = COMP_ACT_SELF,
+		.self_act_func = NULL,
+		.get_fw_version_fn = get_boot0_hamsa_fw_version,
+		.self_apply_work_func = NULL,
+		.comp_version_str = NULL,
+	},
+	{
+		.enable = true,
+		.comp_classification = COMP_CLASS_TYPE_DOWNSTREAM,
+		.comp_identifier = COMPNT_MEDHA0,
+		.comp_classification_index = 0x00,
+		.pre_update_func = pldm_pre_mtia_flash_update,
+		.update_func = pldm_mtia_flash_update,
+		.pos_update_func = pldm_post_mtia_flash_update,
+		.inf = COMP_UPDATE_VIA_SPI,
+		.activate_method = COMP_ACT_SELF,
+		.self_act_func = NULL,
+		.get_fw_version_fn = get_boot0_medha0_fw_version,
+		.self_apply_work_func = NULL,
+		.comp_version_str = NULL,
+	},
+	{
+		.enable = true,
+		.comp_classification = COMP_CLASS_TYPE_DOWNSTREAM,
+		.comp_identifier = COMPNT_MEDHA1,
+		.comp_classification_index = 0x00,
+		.pre_update_func = pldm_pre_mtia_flash_update,
+		.update_func = pldm_mtia_flash_update,
+		.pos_update_func = pldm_post_mtia_flash_update,
+		.inf = COMP_UPDATE_VIA_SPI,
+		.activate_method = COMP_ACT_SELF,
+		.self_act_func = NULL,
+		.get_fw_version_fn = get_boot0_medha1_fw_version,
+		.self_apply_work_func = NULL,
+		.comp_version_str = NULL,
+	},
+	VR_COMPONENT_DEF(COMPNT_VR_3V3),
 };
 
 uint8_t plat_pldm_query_device_identifiers(const uint8_t *buf, uint16_t len, uint8_t *resp,
@@ -126,14 +723,20 @@ uint8_t plat_pldm_query_device_identifiers(const uint8_t *buf, uint16_t len, uin
 	// Set the device id for sd bic
 	uint8_t deviceId[PLDM_PCI_DEVICE_ID_LENGTH] = { 0x00, 0x00 };
 
+	uint8_t slotNumber = plat_get_eid() / 10;
+	uint8_t slot[PLDM_ASCII_MODEL_NUMBER_SHORT_STRING_LENGTH] = { (char)(slotNumber + '0') };
+
 	uint8_t total_size_of_iana_descriptor =
 		sizeof(struct pldm_descriptor_tlv) + sizeof(iana) - 1;
 
 	uint8_t total_size_of_device_id_descriptor =
 		sizeof(struct pldm_descriptor_tlv) + sizeof(deviceId) - 1;
 
+	uint8_t total_size_of_slot_descriptor =
+		sizeof(struct pldm_descriptor_tlv) + sizeof(slot) - 1;
+
 	if (sizeof(struct pldm_query_device_identifiers_resp) + total_size_of_iana_descriptor +
-		    total_size_of_device_id_descriptor >
+		    total_size_of_device_id_descriptor + total_size_of_slot_descriptor >
 	    PLDM_MAX_DATA_SIZE) {
 		LOG_ERR("QueryDeviceIdentifiers data length is over PLDM_MAX_DATA_SIZE define size %d",
 			PLDM_MAX_DATA_SIZE);
@@ -172,11 +775,27 @@ uint8_t plat_pldm_query_device_identifiers(const uint8_t *buf, uint16_t len, uin
 	memcpy(end_of_id_ptr, tlv_ptr, total_size_of_device_id_descriptor);
 	free(tlv_ptr);
 
-	resp_p->device_identifiers_len =
-		total_size_of_iana_descriptor + total_size_of_device_id_descriptor;
+	tlv_ptr = malloc(total_size_of_slot_descriptor);
+	if (tlv_ptr == NULL) {
+		LOG_ERR("Memory allocation failed!");
+		return PLDM_ERROR;
+	}
+
+	tlv_ptr->descriptor_type = PLDM_ASCII_MODEL_NUMBER_SHORT_STRING;
+	tlv_ptr->descriptor_length = PLDM_ASCII_MODEL_NUMBER_SHORT_STRING_LENGTH;
+	memcpy(tlv_ptr->descriptor_data, slot, sizeof(slot));
+
+	end_of_id_ptr += total_size_of_device_id_descriptor;
+	memcpy(end_of_id_ptr, tlv_ptr, total_size_of_slot_descriptor);
+	free(tlv_ptr);
+
+	resp_p->device_identifiers_len = total_size_of_iana_descriptor +
+					 total_size_of_device_id_descriptor +
+					 total_size_of_slot_descriptor;
 
 	*resp_len = sizeof(struct pldm_query_device_identifiers_resp) +
-		    total_size_of_iana_descriptor + total_size_of_device_id_descriptor;
+		    total_size_of_iana_descriptor + total_size_of_device_id_descriptor +
+		    total_size_of_slot_descriptor;
 
 	LOG_INF("pldm_query_device_identifiers done");
 	return PLDM_SUCCESS;
@@ -205,10 +824,14 @@ static uint8_t pldm_pre_vr_update(void *fw_update_param)
 	CHECK_NULL_ARG_WITH_RETURN(fw_update_param, 1);
 
 	pldm_fw_update_param_t *p = (pldm_fw_update_param_t *)fw_update_param;
+	if (get_asic_board_id() != ASIC_BOARD_ID_EVB && p->comp_id == COMPNT_VR_3V3) {
+		LOG_ERR("only evb support 3V3 vr update");
+		return 1;
+	}
 
 	/* Stop sensor polling */
 	set_plat_sensor_polling_enable_flag(false);
-	k_msleep(100);
+	k_msleep(2000);
 
 	uint8_t sensor_id = 0;
 	char sensor_name[MAX_AUX_SENSOR_NAME_LEN] = { 0 };
@@ -227,11 +850,55 @@ static uint8_t pldm_pre_vr_update(void *fw_update_param)
 
 	return 0;
 }
+
+static uint8_t plat_pldm_vr_update(void *fw_update_param)
+{
+	uint8_t ret = 1;
+	CHECK_NULL_ARG_WITH_RETURN(fw_update_param, 1);
+	pldm_fw_update_param_t *p = (pldm_fw_update_param_t *)fw_update_param;
+	uint8_t sensor_id = 0;
+	char sensor_name[MAX_AUX_SENSOR_NAME_LEN] = { 0 };
+
+	if (!find_sensor_id_and_name_by_firmware_comp_id(p->comp_id, &sensor_id, sensor_name)) {
+		LOG_ERR("Can't find sensor id and name by comp id: 0x%x", p->comp_id);
+		return 1;
+	}
+
+	sensor_cfg *cfg = get_sensor_cfg_by_sensor_id(sensor_id);
+	CHECK_NULL_ARG_WITH_RETURN(cfg, 1);
+
+	if (cfg->type == sensor_dev_mp29816a) {
+		if (strncmp(p->comp_version_str, KEYWORD_VR_MP29816A,
+			    ARRAY_SIZE(KEYWORD_VR_MP29816A) - 1)) {
+			LOG_ERR("Wrong VR module stop FW update!");
+			goto exit;
+		}
+	} else if (cfg->type == sensor_dev_mp2971) {
+		if (strncmp(p->comp_version_str, KEYWORD_VR_MP2971,
+			    ARRAY_SIZE(KEYWORD_VR_MP2971) - 1)) {
+			LOG_ERR("Wrong VR module stop FW update!");
+			goto exit;
+		}
+	} else if (cfg->type == sensor_dev_raa228249) {
+		if (strncmp(p->comp_version_str, KEYWORD_VR_RAA228249,
+			    ARRAY_SIZE(KEYWORD_VR_RAA228249) - 1)) {
+			LOG_ERR("Wrong VR module stop FW update!");
+			goto exit;
+		}
+	}
+
+	ret = pldm_vr_update(fw_update_param);
+
+exit:
+	return ret;
+}
+
 static uint8_t pldm_post_vr_update(void *fw_update_param)
 {
 	ARG_UNUSED(fw_update_param);
 
 	/* Start sensor polling */
+	k_msleep(2000);
 	set_plat_sensor_polling_enable_flag(true);
 
 	return 0;
@@ -248,12 +915,24 @@ static bool get_vr_fw_version(void *info_p, uint8_t *buf, uint8_t *len)
 	uint8_t sensor_id = 0;
 	char sensor_name[MAX_AUX_SENSOR_NAME_LEN] = { 0 };
 
-	if (is_mb_dc_on() == false)
+	if (check_p3v3_p5v_pwrgd() == false)
 		return ret;
+
+	/* block getting vr fw version during update */
+	if (is_update_state_idle_or_learn_comp() == false) {
+		LOG_INF("Comp id %d FW version request failed due to FW update in progress",
+			p->comp_identifier);
+		return ret;
+	}
 
 	if (!find_sensor_id_and_name_by_firmware_comp_id(p->comp_identifier, &sensor_id,
 							 sensor_name)) {
 		LOG_ERR("Can't find sensor id and name by comp id: 0x%x", p->comp_identifier);
+		return ret;
+	}
+
+	if (get_asic_board_id() != ASIC_BOARD_ID_EVB && p->comp_identifier == COMPNT_VR_3V3) {
+		// LOG_DBG("only evb support 3V3 vr version get");
 		return ret;
 	}
 
@@ -262,7 +941,7 @@ static bool get_vr_fw_version(void *info_p, uint8_t *buf, uint8_t *len)
 
 	if ((cfg->pre_sensor_read_hook)) {
 		if ((cfg->pre_sensor_read_hook)(cfg, cfg->pre_sensor_read_args) == false) {
-			LOG_DBG("%d read vr fw pre hook fail!", sensor_id);
+			LOG_ERR("%d read vr fw pre hook fail!", sensor_id);
 			return false;
 		}
 	};
@@ -312,7 +991,7 @@ static bool get_vr_fw_version(void *info_p, uint8_t *buf, uint8_t *len)
 		[VR_MODULE_UNKNOWN] = NULL,
 	};
 
-	const char *remain_str_p = ", Remaining Write: ";
+	const char *remain_str_p = ", Remain: ";
 	uint8_t *buf_p = buf;
 	const uint8_t *vr_name_p = vr_name[vr_module];
 	*len = 0;
@@ -329,6 +1008,9 @@ static bool get_vr_fw_version(void *info_p, uint8_t *buf, uint8_t *len)
 	if (cfg->type == sensor_dev_mp2891 || cfg->type == sensor_dev_mp29816a) {
 		*len += bin2hex((uint8_t *)&version, 2, buf_p, 4);
 		buf_p += 4;
+	} else if (cfg->type == sensor_dev_raa228249 || cfg->type == sensor_dev_mp2971) {
+		*len += bin2hex((uint8_t *)&version, 4, buf_p, 8);
+		buf_p += 8;
 	} else {
 		LOG_ERR("Unsupport VR type(%d)", cfg->type);
 	}
@@ -346,12 +1028,28 @@ static bool get_vr_fw_version(void *info_p, uint8_t *buf, uint8_t *len)
 		buf_p += 4;
 	}
 
+	// // add vr rail name
+	// add VR rail name with a space
+	const uint8_t *vr_rail_name_p = sensor_name;
+	// print VR rail name
+	const char *space_str_p = ", ";
+
+	// add ", " separator
+	memcpy(buf_p, space_str_p, strlen(space_str_p));
+	buf_p += strlen(space_str_p);
+	*len += strlen(space_str_p);
+
+	// copy rail name
+	size_t rail_name_len = strlen((const char *)vr_rail_name_p);
+	memcpy(buf_p, vr_rail_name_p, rail_name_len);
+	buf_p += rail_name_len;
+	*len += rail_name_len;
 	ret = true;
 
 err:
 	if ((cfg->post_sensor_read_hook)) {
 		if ((cfg->post_sensor_read_hook)(cfg, cfg->post_sensor_read_args, 0) == false) {
-			LOG_DBG("%d read vr fw post hook fail!", sensor_id);
+			LOG_ERR("%d read vr fw post hook fail!", sensor_id);
 			ret = false;
 		}
 	}
@@ -374,4 +1072,40 @@ bool find_sensor_id_and_name_by_firmware_comp_id(uint8_t comp_identifier, uint8_
 	}
 
 	return false;
+}
+
+void plat_reset_prepare()
+{
+	set_plat_sensor_polling_enable_flag(false);
+	set_cpld_polling_enable_flag(false);
+	k_msleep(PLAT_WAIT_SENSOR_POLLING_END_DELAY_MS);
+
+	const char *i2c_labels[] = { "I2C_0", "I2C_1", "I2C_2", "I2C_3", "I2C_4",  "I2C_5",
+				     "I2C_6", "I2C_7", "I2C_8", "I2C_9", "I2C_10", "I2C_11" };
+
+	for (int i = 0; i < ARRAY_SIZE(i2c_labels); i++) {
+		const struct device *check_i2c_dev_by_bus = device_get_binding(i2c_labels[i]);
+		if (!check_i2c_dev_by_bus) {
+			LOG_ERR("Failed to get binding for %s", i2c_labels[i]);
+			continue;
+		}
+
+		int ret = i2c_npcm_device_disable(check_i2c_dev_by_bus);
+		if (ret) {
+			LOG_ERR("Failed to disable %s (ret=%d)", i2c_labels[i], ret);
+		} else {
+			LOG_INF("%s disabled", i2c_labels[i]);
+		}
+	}
+}
+
+void pal_warm_reset_prepare()
+{
+	LOG_INF("cmd platform warm reset prepare");
+	plat_reset_prepare();
+}
+
+void update_temp_boot0_version(uint32_t version, uint8_t index)
+{
+	version_boot0[index] = version;
 }

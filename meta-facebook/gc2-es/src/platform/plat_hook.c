@@ -35,6 +35,7 @@
 #include "xdpe15284.h"
 #include "util_sys.h"
 #include "plat_class.h"
+#include "util_pmbus.h"
 
 #include "i2c-mux-tca9548.h"
 
@@ -48,22 +49,46 @@ LOG_MODULE_REGISTER(plat_hook);
 #define ADJUST_LTC4282_POWER(x) ((x * 0.98) - 0.2)
 #define ADJUST_LTC4282_CURRENT(x) ((x * 0.99) - 0.2)
 
+struct k_mutex xdpe15284_mutex;
+
 /**************************************************************************************************
  * INIT ARGS
 **************************************************************************************************/
 adc_asd_init_arg adc_asd_init_args[] = { [0] = { .is_init = false } };
 
 adm1278_init_arg adm1278_init_args[] = {
-	[0] = { .is_init = false, .config = { 0x3F1C }, .r_sense = 0.25 }
+	[0] = { .is_init = false, .config = { 0x3F1C }, .r_sense = 1 }
 };
 mp5990_init_arg mp5990_init_args[] = { [0] = { .is_init = false,
-					       .iout_cal_gain = 0x0104,
-					       .iout_oc_fault_limit = 0x0028,
+					       .iout_cal_gain = 0x00B0,
+					       .iout_oc_fault_limit = 0xFFFF,
 					       .ocw_sc_ref = 0xFFFF },
 				       [1] = { .is_init = false,
 					       .iout_cal_gain = 0x01BF,
 					       .iout_oc_fault_limit = 0x0046,
 					       .ocw_sc_ref = 0xFFFF } };
+mp5998_plat_init_arg mp5998_plat_init_args[] = {
+	[0] = { .vin_ov_fault_limit = 0x0370, //55h value : 13.75      lsb : 1/64 V
+		.vin_ov_warn_limit = 0x0360, //57h value : 13.5
+		.vin_uv_warn_limit = 0x028D, //58h value : 10.203125
+		.iin_oc_fault_limit = 0x01B7, //5Bh value : 27.4375    lsb : 1/16 A
+		.iin_oc_warn_limit = 0x0195, //5Dh value : 25.3125
+		.fault_mask = 0x0008, //D4h
+		.efuse_cfg = 0x49CC, //C4h
+		.protect_en = 0x3EFF } //CAh
+};
+
+tps25990_init_arg tps25990_init_args[] = { [0] = { .is_init = false }, [1] = { .is_init = false } };
+
+tps25990_plat_init_arg tps25990_plat_init_args[] = {
+	[0] = { .vin_ov_fault_limit = 0x000B, //55h value : 13.79
+		.vin_ov_warn_limit = 0x00B1, //57h value : 13.482
+		.vin_uv_warn_limit = 0x0086, //58h value : 10.207
+		.vin_uv_fault_limit = 0x0077, //59h value : 9.064
+		.iin_oc_warn_limit = 0x0078, //5Dh value : 25.210
+		.protect_en = 0xA2 } //F8h
+};
+
 ltc4286_init_arg ltc4286_init_args[] = {
 	[0] = { .is_init = false, .r_sense_mohm = 0.25, .mfr_config_1 = { 0x1570 } },
 	[1] = { .is_init = false, .r_sense_mohm = 0.25, .mfr_config_1 = { 0x3570 } }
@@ -89,6 +114,21 @@ pmic_init_arg pmic_init_args[] = {
 // R_load is the value of resistance connected to EFUSE , and EFUSE would adjust the reading accuracy according to r_load
 max16550a_init_arg max16550a_init_args[] = { [0] = { .r_load = 14000 } };
 
+sq52205_init_arg sq52205_init_args[] = {
+	[0] = { .is_init = false, .current_lsb = 0.001, .r_shunt = 0.002,
+	.config = {
+			.operating_mode =0b111,
+			.shunt_volt_time = 0b100,
+			.bus_volt_time = 0b100,
+			.aver_mode = 0b011, //set 64 average times
+			.rsvd = 0b000,
+			.reset_bit = 0b0,
+	},
+	.is_need_accum_config_init = false,
+	.is_need_set_alert_threshold = false,
+	},
+};
+
 /**************************************************************************************************
  *  PRE-HOOK/POST-HOOK ARGS
  **************************************************************************************************/
@@ -104,11 +144,102 @@ isl69259_pre_proc_arg isl69259_pre_read_args[] = {
 	[1] = { 0x1 },
 };
 
+/* TPS53689 page arguments: page 0 and page 1 */
+tps53689_pre_proc_arg tps53689_pre_read_args[] = {
+	[0] = { .vr_page = 0x0 },
+	[1] = { .vr_page = 0x1 },
+};
+
+vr_page_cfg xdpe15284_page[] = {
+	[0] = { .vr_page = PMBUS_PAGE_0 },
+	[1] = { .vr_page = PMBUS_PAGE_1 },
+};
+
 dimm_pre_proc_arg dimm_pre_proc_args[] = {
 	[0] = { .is_present_checked = false }, [1] = { .is_present_checked = false },
 	[2] = { .is_present_checked = false }, [3] = { .is_present_checked = false },
 	[4] = { .is_present_checked = false }, [5] = { .is_present_checked = false }
 };
+
+ina233_init_arg ina233_init_args[] = {
+	[0] = {
+		.is_init = false,
+		.current_lsb = 0.001,
+		.r_shunt = 0.002,
+		.mfr_config_init = false,
+		.is_need_mfr_device_config_init = false,
+		.is_need_set_alert_threshold = false,
+	},
+	[1] = {
+		.is_init = false,
+		.current_lsb = 0.001,
+		.r_shunt = 0.002,
+		.mfr_config_init = false,
+		.is_need_mfr_device_config_init = false,
+		.is_need_set_alert_threshold = false,
+	},
+	[2] = {
+		.is_init = false,
+		.current_lsb = 0.001,
+		.r_shunt = 0.002,
+		.mfr_config_init = false,
+		.is_need_mfr_device_config_init = false,
+		.is_need_set_alert_threshold = false,
+	},
+	[3] = {
+		.is_init = false,
+		.current_lsb = 0.001,
+		.r_shunt = 0.002,
+		.mfr_config_init = false,
+		.is_need_mfr_device_config_init = false,
+		.is_need_set_alert_threshold = false,
+	},
+};
+
+bool init_vr_write_protect(uint8_t bus, uint8_t addr, uint8_t default_val)
+{
+	int ret = 0;
+	uint8_t page = 0;
+	uint8_t reg_val = 0;
+
+	xdpe15284_set_write_protect_default_val(default_val);
+	ret = pmbus_read_command(bus, addr, PMBUS_PAGE, &reg_val, 1);
+	if (ret != 0) {
+		LOG_ERR("Get bus: 0x%x, addr: 0x%x, page fail", bus, addr);
+		return false;
+	}
+
+	page = reg_val;
+	if (xdpe15284_set_write_protect(bus, addr, XDPE15284_ENABLE_WRITE_PROTECT) != true) {
+		LOG_ERR("Initialize page: 0x%x write protect to 0x%x fail", page, default_val);
+		return false;
+	}
+
+	page = (page == PMBUS_PAGE_0 ? PMBUS_PAGE_1 : PMBUS_PAGE_0);
+	ret = pmbus_set_page(bus, addr, page);
+	if (ret != 0) {
+		LOG_ERR("Set bus: 0x%x, addr: 0x%x to page: 0x%x fail", bus, addr, page);
+		return false;
+	}
+
+	ret = pmbus_read_command(bus, addr, PMBUS_PAGE, &reg_val, 1);
+	if (ret != 0) {
+		LOG_ERR("Get bus: 0x%x, addr: 0x%x, page fail", bus, addr);
+		return false;
+	}
+
+	if (reg_val != page) {
+		LOG_ERR("Set page to 0x%x fail", page);
+		return false;
+	}
+
+	if (xdpe15284_set_write_protect(bus, addr, XDPE15284_ENABLE_WRITE_PROTECT) != true) {
+		LOG_ERR("Initialize page: 0x%x write protect to 0x%x fail", page, default_val);
+		return false;
+	}
+
+	return true;
+}
 
 /**************************************************************************************************
  *  PRE-HOOK/POST-HOOK FUNC
@@ -142,6 +273,141 @@ bool pre_isl69259_read(sensor_cfg *cfg, void *args)
 		LOG_ERR("pre_isl69259_read, set page fail");
 		return false;
 	}
+	return true;
+}
+
+K_MUTEX_DEFINE(xdpe15284_mutex);
+extern vr_page_cfg xdpe15284_page[];
+
+/* Initialization state of each XDPE VR chip's WP (unique bus+addr) */
+typedef struct {
+	uint8_t bus;
+	uint8_t addr;
+	bool wp_initialized;
+} xdpe_vr_state;
+
+static xdpe_vr_state xdpe_wp_states[] = {
+	{ I2C_BUS5, PVCCD_HV_ADDR, false }, // 0x62
+	{ I2C_BUS5, PVCCINFAON_ADDR, false }, // 0x76
+	{ I2C_BUS5, PVCCIN_ADDR, false }, // 0x60
+};
+
+static inline xdpe_vr_state *get_xdpe_vr_state(uint8_t bus, uint8_t addr)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(xdpe_wp_states); ++i) {
+		if (xdpe_wp_states[i].bus == bus && xdpe_wp_states[i].addr == addr) {
+			return &xdpe_wp_states[i];
+		}
+	}
+	return NULL;
+}
+
+/* TPS53689 pre read function
+ *
+ * Sets the PMBus PAGE register before reading.
+ * TPS53689 uses the same page-switch mechanism as ISL69259:
+ * write register 0x00 with the desired page value.
+ * No mutex or write-protect setup is required.
+ *
+ * @param cfg   pointer to sensor_cfg (must not be NULL)
+ * @param args  pointer to tps53689_pre_proc_arg (must not be NULL)
+ * @retval true  if page is set successfully
+ * @retval false if I2C write fails
+ */
+bool pre_tps53689_read(sensor_cfg *cfg, void *args)
+{
+	CHECK_NULL_ARG_WITH_RETURN(cfg, false);
+	CHECK_NULL_ARG_WITH_RETURN(args, false);
+
+	const tps53689_pre_proc_arg *pre_proc_args = (tps53689_pre_proc_arg *)args;
+	uint8_t retry = 5;
+	I2C_MSG msg;
+
+	/* Set PMBus PAGE (register 0x00) */
+	msg.bus = cfg->port;
+	msg.target_addr = cfg->target_addr;
+	msg.tx_len = 2;
+	msg.data[0] = 0x00; /* PAGE command */
+	msg.data[1] = pre_proc_args->vr_page;
+
+	if (i2c_master_write(&msg, retry)) {
+		LOG_ERR("pre_tps53689_read: set page 0x%x fail, sensor: 0x%x",
+			pre_proc_args->vr_page, cfg->num);
+		return false;
+	}
+
+	return true;
+}
+
+/* All WP initialization states reset after a 12V cycle (DC power off/on). */
+void xdpe_reset_wp_states_after_power_cycle(void)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(xdpe_wp_states); ++i) {
+		xdpe_wp_states[i].wp_initialized = false;
+	}
+}
+
+/* XDPE15284 pre read function
+ *
+ * Purpose:
+ *   - Some XDPE parts enable write-protect by default and reject PAGE command.
+ *   - This hook first configures write-protect per VR device (once per device),
+ *     then sets the PMBus PAGE. It also locks a mutex to serialize page switching.
+ *
+ * Behavior:
+ *   1) For the current VR (bus+addr), if write-protect is not initialized yet,
+ *      call init_vr_write_protect() to allow PAGE command, then mark initialized.
+ *   2) Lock the xdpe15284_mutex to avoid concurrent PAGE changes.
+ *   3) Send PMBUS_PAGE (0x00) with the page value provided in args.
+ *
+ * @param cfg   pointer to sensor_cfg of this VR sensor (must not be NULL)
+ * @param args  pointer to vr_page_cfg, where args->vr_page is PAGE value
+ * @retval true  if PAGE is successfully written (mutex remains locked and will be released in post)
+ * @retval false if mutex lock fails or PAGE write fails (mutex is unlocked on failure)
+ */
+bool pre_xdpe15284_read(sensor_cfg *cfg, void *args)
+{
+	CHECK_NULL_ARG_WITH_RETURN(cfg, false);
+	CHECK_NULL_ARG_WITH_RETURN(args, false);
+
+	const vr_page_cfg *xdpe15284_vr_page = (const vr_page_cfg *)args;
+	I2C_MSG msg = { 0 };
+	int retry = 3;
+
+	/* Per-device write-protect init (once per device) */
+	xdpe_vr_state *st = get_xdpe_vr_state(cfg->port, cfg->target_addr);
+	if (st != NULL && st->wp_initialized == false) {
+		bool wp_ok = init_vr_write_protect(
+			cfg->port, cfg->target_addr,
+			XDPE15284_DISABLE_ALL_WRITE_EXCEPT_THREE_COMMANDS_VAL);
+		if (wp_ok != true) {
+			LOG_WRN("XDPE: init write protect fail, try PAGE anyway, sensor: 0x%x",
+				cfg->num);
+		} else {
+			st->wp_initialized = true;
+		}
+	}
+
+	/* Serialize page switching with a mutex */
+	int mret = k_mutex_lock(&xdpe15284_mutex, K_MSEC(MUTEX_LOCK_INTERVAL_MS));
+	if (mret != 0) {
+		LOG_ERR("XDPE: mutex lock fail, status: %d, sensor: 0x%x", mret, cfg->num);
+		return false;
+	}
+
+	/* Set PMBUS_PAGE to the requested page */
+	msg.bus = cfg->port;
+	msg.target_addr = cfg->target_addr;
+	msg.tx_len = 2;
+	msg.data[0] = PMBUS_PAGE;
+	msg.data[1] = xdpe15284_vr_page->vr_page;
+
+	if (i2c_master_write(&msg, retry) != 0) {
+		LOG_ERR("XDPE: set PAGE fail, sensor: 0x%x", cfg->num);
+		k_mutex_unlock(&xdpe15284_mutex);
+		return false;
+	}
+
 	return true;
 }
 
@@ -284,7 +550,86 @@ bool post_cpu_margin_read(sensor_cfg *cfg, void *args, int *reading)
 		return check_reading_pointer_null_is_allowed(cfg);
 
 	sensor_val *sval = (sensor_val *)reading;
-	sval->integer = -sval->integer; /* for BMC minus */
+	if (sval->integer == 1) {
+		sval->integer = 0;
+	}
+	return true;
+}
+
+static bool get_cpu_tjmax(uint8_t addr, int *reading)
+{
+	if (!reading) {
+		LOG_ERR("Invalid argument");
+		return false;
+	}
+
+	const uint16_t param = 0x00;
+	const uint8_t rlen = 0x05;
+	uint8_t rbuf[rlen];
+	memset(rbuf, 0, sizeof(rbuf));
+
+	int ret = peci_read(PECI_CMD_RD_PKG_CFG0, addr, RDPKG_IDX_TJMAX_TEMP, param, rlen, rbuf);
+	if (ret != 0) {
+		LOG_ERR("PECI read error");
+		return false;
+	}
+
+	sensor_val *sval = (sensor_val *)reading;
+	sval->integer = rbuf[3];
+	return true;
+}
+
+bool post_cpu_read(sensor_cfg *cfg, void *args, int *reading)
+{
+	CHECK_NULL_ARG_WITH_RETURN(cfg, false);
+	ARG_UNUSED(args);
+	if (!reading)
+		return check_reading_pointer_null_is_allowed(cfg);
+
+	sensor_val *sval = (sensor_val *)reading;
+
+	sensor_val tjmax_sval = { 0 };
+	if (get_cpu_tjmax(CPU_PECI_ADDR, (int *)&tjmax_sval) == false) {
+		return false;
+	}
+
+	if (sval->integer == (tjmax_sval.integer + 1)) {
+		sval->integer = tjmax_sval.integer;
+	}
+	return true;
+}
+
+bool post_mp5998_voltage_read(sensor_cfg *cfg, void *args, int *reading)
+{
+	CHECK_NULL_ARG_WITH_RETURN(cfg, false);
+	ARG_UNUSED(args);
+
+	if (!reading)
+		return check_reading_pointer_null_is_allowed(cfg);
+
+	sensor_val *sval = (sensor_val *)reading;
+	float val = (float)sval->integer + (sval->fraction / 1000.0);
+
+	val = val * 0.5; //lsb = 1/64 V
+	sval->integer = (int)val & 0xFFFF;
+	sval->fraction = (val - sval->integer) * 1000;
+	return true;
+}
+
+bool post_mp5998_power_read(sensor_cfg *cfg, void *args, int *reading)
+{
+	CHECK_NULL_ARG_WITH_RETURN(cfg, false);
+	ARG_UNUSED(args);
+
+	if (!reading)
+		return check_reading_pointer_null_is_allowed(cfg);
+
+	sensor_val *sval = (sensor_val *)reading;
+	float val = (float)sval->integer + (sval->fraction / 1000.0);
+
+	val = val * 0.5; //lsb = 0.5 W
+	sval->integer = (int)val & 0xFFFF;
+	sval->fraction = (val - sval->integer) * 1000;
 	return true;
 }
 
@@ -429,3 +774,29 @@ bool post_ltc4282_read(sensor_cfg *cfg, void *args, int *reading)
 	return true;
 }
 
+/* XDPE15284 post read function
+ *
+ * Purpose:
+ *   - Release the mutex locked in pre_xdpe15284_read().
+ *   - No value adjustment here; only synchronization clean-up.
+ *
+ * @param cfg      pointer to sensor_cfg of this VR sensor (must not be NULL)
+ * @param args     pointer to NULL (unused)
+ * @param reading  pointer to reading from previous step (unused here)
+ * @retval true  if mutex is successfully released or was not locked
+ * @retval false if mutex unlock fails
+ */
+bool post_xdpe15284_read(sensor_cfg *cfg, void *args, int *reading)
+{
+	CHECK_NULL_ARG_WITH_RETURN(cfg, false);
+	ARG_UNUSED(args);
+	ARG_UNUSED(reading);
+
+	int uret = k_mutex_unlock(&xdpe15284_mutex);
+	if (uret != 0) {
+		LOG_ERR("XDPE: mutex unlock fail, status: %d, sensor: 0x%x", uret, cfg->num);
+		return false;
+	}
+
+	return true;
+}

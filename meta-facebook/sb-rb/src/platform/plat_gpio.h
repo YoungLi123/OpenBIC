@@ -29,8 +29,8 @@ void gpio_int_default();
 #define name_gpio0	\
 	gpio_name_to_num(FM_ASIC_0_THERMTRIP_R_N) \
 	gpio_name_to_num(RST_IRIS_PWR_ON_PLD_R1_N) \
-	gpio_name_to_num(Reserve_GPIO02) \
-	gpio_name_to_num(Reserve_GPIO03) \
+	gpio_name_to_num(HAMSA_SW_EN) \
+	gpio_name_to_num(MEDHA0_SW_EN) \
 	gpio_name_to_num(Reserve_GPIO04) \
 	gpio_name_to_num(ALL_VR_PM_ALERT_R_N) \
 	gpio_name_to_num(SMB_HAMSA_MMC_LVC33_ALERT_N) \
@@ -92,8 +92,8 @@ void gpio_int_default();
 #define name_gpio7	\
 	gpio_name_to_num(Reserve_GPIO70) \
 	gpio_name_to_num(NC_SPI_HAMSA_CRM_MUX_IN1) \
-	gpio_name_to_num(Reserve_GPIO72) \
-	gpio_name_to_num(Reserve_GPIO73) \
+	gpio_name_to_num(MEDHA1_SW_EN) \
+	gpio_name_to_num(SPI_ADC_CS0_N) \
 	gpio_name_to_num(GPIO74_STRAP_DSW_EN) \
 	gpio_name_to_num(GPIO75_STRAP_JEN_N) \
 	gpio_name_to_num(Reserve_GPIO76) \
@@ -117,30 +117,30 @@ void gpio_int_default();
 	gpio_name_to_num(Reserve_GPIO96) \
 	gpio_name_to_num(Reserve_GPIO97)
 #define name_gpioA	\
-	gpio_name_to_num(MEDHA0_CURRENT_SENSE_0_LS_LVC33_R) \
-	gpio_name_to_num(MEDHA0_CURRENT_SENSE_1_LS_LVC33_R) \
+	gpio_name_to_num(MEDHA0_PWR_CAP_LV1_LVC33) \
+	gpio_name_to_num(Reserve_GPIOA1) \
 	gpio_name_to_num(Reserve_GPIOA2) \
-	gpio_name_to_num(MEDHA1_CURRENT_SENSE_0_LS_LVC33_R) \
-	gpio_name_to_num(MEDHA1_CURRENT_SENSE_1_LS_LVC33_R) \
+	gpio_name_to_num(MEDHA1_PWR_CAP_LV1_LVC33) \
+	gpio_name_to_num(Reserve_GPIOA4) \
 	gpio_name_to_num(Reserve_GPIOA5) \
 	gpio_name_to_num(Reserve_GPIOA6) \
 	gpio_name_to_num(Reserve_GPIOA7)
 #define name_gpioB	\
 	gpio_name_to_num(RSVD_GPIO_1) \
-	gpio_name_to_num(Reserve_GPIOB1) \
+	gpio_name_to_num(ASIC_TYPE_ID1) \
 	gpio_name_to_num(Reserve_GPIOB2) \
-	gpio_name_to_num(Reserve_GPIOB3) \
+	gpio_name_to_num(ASIC_TYPE_ID0) \
 	gpio_name_to_num(Reserve_GPIOB4) \
 	gpio_name_to_num(Reserve_GPIOB5) \
 	gpio_name_to_num(Reserve_GPIOB6) \
 	gpio_name_to_num(Reserve_GPIOB7)
 #define name_gpioC	\
 	gpio_name_to_num(Reserve_GPIOC0) \
-	gpio_name_to_num(Reserve_GPIOC1) \
+	gpio_name_to_num(SPI_ADC_CS1_N) \
 	gpio_name_to_num(Reserve_GPIOC2) \
 	gpio_name_to_num(Reserve_GPIOC3) \
-	gpio_name_to_num(Reserve_GPIOC4) \
-	gpio_name_to_num(Reserve_GPIOC5) \
+	gpio_name_to_num(MEDHA0_CNV) \
+	gpio_name_to_num(MEDHA1_CNV) \
 	gpio_name_to_num(Reserve_GPIOC6) \
 	gpio_name_to_num(Reserve_GPIOC7)
 #define name_gpioD	\

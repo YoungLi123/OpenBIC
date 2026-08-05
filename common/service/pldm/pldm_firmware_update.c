@@ -53,6 +53,10 @@ LOG_MODULE_DECLARE(pldm);
 #define GET_EEPROM_SLAVE_MASK(offset) (((offset) >> 16) & 0xF)
 #define GET_EERPOM_OFFSET(offset) ((offset) & 0xFFFF)
 
+#ifndef PLDM_UPDATE_DELAY_AFTER_POST_UPDATE
+#define PLDM_UPDATE_DELAY_AFTER_POST_UPDATE 3000
+#endif
+
 pldm_fw_update_info_t *comp_config = NULL;
 uint8_t comp_config_count = 0;
 
@@ -85,6 +89,15 @@ __weak uint16_t plat_find_update_info_work(uint16_t comp_id)
 	// Adjust component id to find device info by platform
 	return comp_id;
 }
+
+#ifdef ENABLE_PLDM_PASS_COMPONENT_CHECK
+__weak uint8_t plat_pldm_pass_component_table_check(uint16_t num_of_comp,
+						    const uint8_t *comp_image_version_str,
+						    uint8_t comp_image_version_str_len)
+{
+	return PLDM_SUCCESS;
+}
+#endif
 
 int get_descriptor_type_length(uint16_t type)
 {
@@ -645,7 +658,7 @@ static void state_update(uint8_t state)
 	}
 }
 
-static void pldm_status_reset()
+void pldm_status_reset()
 {
 	state_update(STATE_IDLE);
 	cur_aux_state = STATE_AUX_NOT_IN_UPDATE;
@@ -658,7 +671,7 @@ static void pldm_status_reset()
 
 static void exit_update_mode()
 {
-	printk("PLDM update mode timeout, exiting update mode...\n");
+	LOG_WRN("PLDM update mode timeout, exiting update mode...");
 	pldm_status_reset();
 }
 
@@ -958,6 +971,16 @@ void req_fw_update_handler(void *mctp_p, void *ext_params, void *arg)
 		apply_result = fw_info->self_apply_work_func(fw_info->self_apply_work_arg);
 	}
 
+#ifdef PLDM_UPDATE_POST_UPDATE_BEFORE_APPLY_COMPLETE
+	if (fw_info->pos_update_func) {
+		if (fw_info->pos_update_func(&update_param)) {
+			LOG_ERR("post-update failed!");
+			apply_result = PLDM_FW_UPDATE_GENERIC_ERROR;
+		}
+	}
+	k_msleep(PLDM_UPDATE_DELAY_AFTER_POST_UPDATE);
+#endif
+
 	if (report_tranfer(mctp_p, ext_params, apply_result)) {
 		report_tranfer(mctp_p, ext_params, PLDM_FW_UPDATE_GENERIC_ERROR);
 		cur_aux_state = STATE_AUX_FAILED;
@@ -968,12 +991,15 @@ void req_fw_update_handler(void *mctp_p, void *ext_params, void *arg)
 	cur_aux_state = STATE_AUX_SUCCESS;
 
 exit:
+#ifndef PLDM_UPDATE_POST_UPDATE_BEFORE_APPLY_COMPLETE
 	/* do post-update */
 	if (fw_info->pos_update_func) {
 		if (fw_info->pos_update_func(&update_param)) {
 			LOG_ERR("post-update failed!");
 		}
 	}
+#endif
+
 	fw_update_cfg.image_size = 0;
 	if (fw_update_tid) {
 		fw_update_tid = NULL;
@@ -1068,6 +1094,16 @@ static uint8_t pass_component_table(void *mctp_inst, uint8_t *buf, uint16_t len,
 		req_p->comp_identifier);
 	LOG_HEXDUMP_INF(buf + sizeof(struct pldm_pass_component_table_req), req_p->comp_ver_str_len,
 			"");
+
+#ifdef ENABLE_PLDM_PASS_COMPONENT_CHECK
+	uint8_t check_result = plat_pldm_pass_component_table_check(
+		req_p->comp_identifier, buf + sizeof(struct pldm_pass_component_table_req),
+		req_p->comp_ver_str_len);
+	if (check_result != PLDM_SUCCESS) {
+		resp_p->completion_code = check_result;
+		goto exit;
+	}
+#endif
 
 	if (current_state != STATE_LEARN_COMP) {
 		LOG_ERR("Firmware update failed because current state %d is not %d", current_state,
@@ -1396,11 +1432,15 @@ static uint8_t get_firmware_parameter(void *mctp_inst, uint8_t *buf, uint16_t le
 	CHECK_NULL_ARG_WITH_RETURN(resp_len, PLDM_ERROR);
 	CHECK_NULL_ARG_WITH_RETURN(ext_params, PLDM_ERROR);
 
+#ifdef ENABLE_PLDM_GET_FW_PARAM_DEBUG_LOG
+	LOG_INF("pldm get_firmware_parameter received");
+#endif
+
 	struct pldm_get_firmware_parameters_resp *resp_p =
 		(struct pldm_get_firmware_parameters_resp *)resp;
 
 	*resp_len = 1;
-
+	uint8_t *resp_end = resp + PLDM_MAX_DATA_SIZE;
 	if (len != 0) {
 		resp_p->completion_code = PLDM_ERROR_INVALID_LENGTH;
 		return PLDM_SUCCESS;
@@ -1425,13 +1465,31 @@ static uint8_t get_firmware_parameter(void *mctp_inst, uint8_t *buf, uint16_t le
 	for (uint8_t i = 0; i < comp_config_count; i++) {
 		if (!comp_config[i].get_fw_version_fn)
 			continue;
+		// calculate needed length to avoid overflow
+		uint16_t need_len = sizeof(struct component_parameter_table);
+		uint8_t tmp_ver_len = 0;
+		if (!comp_config[i].get_fw_version_fn(&comp_config[i], NULL, &tmp_ver_len)) {
+			tmp_ver_len = sizeof(error_code);
+		}
+		need_len += tmp_ver_len;
 
-		if (sizeof(struct pldm_get_firmware_parameters_resp) + cnt_len >
+		if (comp_config[i].pending_version_p) {
+			need_len += strlen(comp_config[i].pending_version_p);
+		}
+		// size guard
+		if (sizeof(struct pldm_get_firmware_parameters_resp) + cnt_len + need_len >
 		    PLDM_MAX_DATA_SIZE) {
-			LOG_ERR("Data length %d is over PLDM_MAX_DATA_SIZE define size %d",
-				sizeof(struct pldm_get_firmware_parameters_resp) + cnt_len,
+			LOG_ERR("PLDM overflow: used=%d need=%d max=%d", cnt_len, need_len,
 				PLDM_MAX_DATA_SIZE);
+
 			resp_p->completion_code = PLDM_ERROR;
+			*resp_len = sizeof(struct pldm_get_firmware_parameters_resp);
+			return PLDM_SUCCESS;
+		}
+		if (ver_str_p + need_len > resp_end) {
+			LOG_ERR("PLDM pointer overflow");
+			resp_p->completion_code = PLDM_ERROR;
+			*resp_len = sizeof(struct pldm_get_firmware_parameters_resp);
 			return PLDM_SUCCESS;
 		}
 
@@ -1764,6 +1822,14 @@ bool is_update_state_download_phase()
 bool is_update_state_idle()
 {
 	if (current_state == STATE_IDLE) {
+		return true;
+	}
+	return false;
+}
+
+bool is_update_state_idle_or_learn_comp()
+{
+	if ((current_state == STATE_IDLE) || (current_state == STATE_LEARN_COMP)) {
 		return true;
 	}
 	return false;

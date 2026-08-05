@@ -24,7 +24,7 @@
 #define READ_DDR_TEMP_REQ_LEN 0
 #define READ_DDR_TEMP_RESP_LEN 32
 #define READ_DDR_SLOT_INFO_REQ_LEN 0
-#define READ_DDR_SLOT_INFO_RESP_LEN 68  // 4 + 4*16 bytes
+#define READ_DDR_SLOT_INFO_RESP_LEN 68 // 4 + 4*16 bytes
 #define MAX_DIMM_PER_CXL 4
 #define MAX_CXL_COUNT 2
 
@@ -80,7 +80,7 @@ typedef struct {
 	uint8_t channel_id;
 	uint8_t dimm_silk_screen;
 	uint8_t dimm_present;
-	uint8_t reserved[12];  // 16 bytes per slot
+	uint8_t reserved[12]; // 16 bytes per slot
 } dimm_slot_info_t;
 
 typedef struct {
@@ -89,16 +89,17 @@ typedef struct {
 } read_ddr_slot_info_resp;
 
 typedef struct {
-	bool valid;
-	uint32_t timestamp;
+	bool valid[MAX_CXL_COUNT];
+	uint32_t timestamp[MAX_CXL_COUNT];
 	read_ddr_slot_info_resp slot_info[MAX_CXL_COUNT];
 	uint8_t master_dimm_id[MAX_CXL_COUNT];
+	struct k_mutex mutex[MAX_CXL_COUNT];
 } ddr_slot_info_cache_t;
 
 extern ddr_slot_info_cache_t g_ddr_slot_cache;
 
 uint8_t plat_get_cxl_eid(uint8_t cxl_id);
-void plat_set_dimm_cache(uint8_t *resp_buf, uint8_t cxl_id, uint8_t status);
+void plat_set_dimm_cache(const uint8_t *resp_buf, uint8_t cxl_id, uint8_t status);
 float plat_get_dimm_cache(uint8_t cxl_id, uint8_t dimm_id);
 bool vistara_cci_command(uint8_t cxl_eid, mctp_cci_msg cci_msg, uint8_t *resp, uint8_t resp_len);
 bool vistara_read_ddr_temp(uint8_t cxl_eid, uint8_t *resp);
@@ -107,7 +108,7 @@ int vistara_read_dimm_spd_chunk_eid(uint8_t cxl_eid, uint8_t dimm_idx, uint16_t 
 bool vistara_read_dimm_spd_ddr4(uint8_t cxl_eid, uint8_t dimm_idx,
 				uint8_t out512[VISTARA_SPD_DDR4_TOTAL_BYTES]);
 bool vistara_read_ddr_slot_info(uint8_t cxl_eid, uint8_t *resp);
-int vistara_init_ddr_slot_info(void);
+int vistara_init_ddr_slot_info(uint8_t cxl_id);
 bool vistara_get_dimm_present_from_cache(uint8_t dimm_id);
 
 #endif

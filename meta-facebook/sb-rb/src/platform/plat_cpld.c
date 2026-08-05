@@ -21,15 +21,27 @@
 #include "plat_gpio.h"
 #include "plat_log.h"
 #include "plat_hook.h"
+#include "plat_event.h"
 #include <logging/log.h>
-
-#define CPLD_ADDR (0x4C >> 1)
-#define I2C_BUS_CPLD I2C_BUS11
+#include "plat_led.h"
+#include "plat_class.h"
+#include "plat_ioexp.h"
+#include "shell_plat_power_sequence.h"
+#include "kernel.h"
+#include "plat_isr.h"
+#include "plat_class.h"
 
 #define POLLING_CPLD_STACK_SIZE 2048
 #define CPLD_POLLING_INTERVAL_MS 1000 // 1 second polling interval
 
 #define CHECK_ALL_BITS 0xFF
+#define CHECK_BITS_8 0x80
+#define CHECK_BITS_78 0xC0
+#define CHECK_BITS_678 0xE0
+#define CHECK_BITS_6 0x40
+#define CHECK_BITS_0 0x01
+#define CHECK_BITS_012356 0x6F
+#define CHECK_BITS_631 0x4A
 
 LOG_MODULE_REGISTER(plat_cpld);
 
@@ -44,11 +56,9 @@ bool plat_write_cpld(uint8_t offset, uint8_t *data)
 }
 
 // cpld polling
+K_TIMER_DEFINE(check_ubc_delayed_timer, check_ubc_delayed_timer_handler, NULL);
 void check_cpld_handler();
 K_WORK_DELAYABLE_DEFINE(check_cpld_work, check_cpld_handler);
-
-void check_ubc_delayed_timer_handler(struct k_timer *timer);
-K_TIMER_DEFINE(init_ubc_delayed_timer, check_ubc_delayed_timer_handler, NULL);
 void check_ubc_delayed(struct k_work *work);
 K_WORK_DEFINE(check_ubc_delayed_work, check_ubc_delayed);
 void check_ubc_delayed_timer_handler(struct k_timer *timer)
@@ -56,10 +66,22 @@ void check_ubc_delayed_timer_handler(struct k_timer *timer)
 	k_work_submit(&check_ubc_delayed_work);
 }
 
+struct k_timer *get_ubc_delaytimer()
+{
+	return &check_ubc_delayed_timer;
+}
 K_THREAD_STACK_DEFINE(cpld_polling_stack, POLLING_CPLD_STACK_SIZE);
 struct k_thread cpld_polling_thread;
 k_tid_t cpld_polling_tid;
 
+void ragular_cpld_polling_sem_handler(struct k_timer *timer);
+K_TIMER_DEFINE(ragular_cpld_polling_sem_timer, ragular_cpld_polling_sem_handler, NULL);
+static struct k_sem all_vr_pm_alert_sem; // ALL_VR_PM_ALERT_R_N gpio sem
+
+void ragular_cpld_polling_sem_handler(struct k_timer *timer)
+{
+	k_sem_give(&all_vr_pm_alert_sem);
+}
 // cpld tbd
 //void get_vr_vout_handler(struct k_work *work);
 //K_WORK_DEFINE(vr_vout_work, get_vr_vout_handler);
@@ -71,22 +93,44 @@ typedef struct _vr_error_callback_info_ {
 } vr_error_callback_info;
 
 bool vr_error_callback(cpld_info *cpld_info, uint8_t *current_cpld_value);
+bool asic_temp_error_callback(cpld_info *cpld_info, uint8_t *current_cpld_value);
 
 // clang-format off
 cpld_info cpld_info_table[] = {
-	{ VR_POWER_FAULT_1_REG, 			0x00, 0x00, true, 0x00, false, false, 0x00,  .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_ALL_BITS },
-	{ VR_POWER_FAULT_2_REG, 			0x00, 0x00, true, 0x00, false, false, 0x00,  .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_ALL_BITS },
-	{ VR_POWER_FAULT_3_REG, 			0x00, 0x00, true, 0x00, false, false, 0x00,  .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_ALL_BITS },
-	{ VR_POWER_FAULT_4_REG, 			0x00, 0x00, true, 0x00, false, false, 0x00,  .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_ALL_BITS },
-	{ VR_POWER_FAULT_5_REG, 			0x00, 0x00, true, 0x00, false, false, 0x00,  .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_ALL_BITS },
+	{ VR_EN_PIN_READING_5, 				0x00, 0xFE, true, 0x00, false, 0x00,  .status_changed_cb = ubc_en_changed_callback, .bit_check_mask = CHECK_BITS_0 },
+	{ VR_POWER_FAULT_1_REG, 			0x00, 0x00, true, 0x00, true, 0x00,  .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_ALL_BITS },
+	{ VR_POWER_FAULT_2_REG, 			0x00, 0x00, true, 0x00, true, 0x00,  .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_ALL_BITS },
+	{ VR_POWER_FAULT_3_REG, 			0x00, 0x00, true, 0x00, true, 0x00,  .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_ALL_BITS },
+	{ VR_POWER_FAULT_4_REG, 			0x00, 0x00, true, 0x00, true, 0x00,  .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_ALL_BITS },
+	{ VR_POWER_FAULT_5_REG, 			0x00, 0x00, true, 0x00, true, 0x00,  .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_ALL_BITS },
+	{ VR_SMBUS_ALERT_EVENT_LOG_REG, 	0xFF, 0xFF, true, 0x00, false, 0x00,  .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_ALL_BITS },
+	{ LEAK_DETECT_REG, 					0xFF, 0xFF, true, 0x00, false, 0x00, .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_BITS_6 },
+	{ HBM_CATTRIP_REG, 					0xFF, 0xFF, true, 0x00, true, 0x00,  .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_BITS_78 },
+	{ SYSTEM_ALERT_FAULT_REG, 			0xFF, 0xFF, true, 0x00, false, 0x00, .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_BITS_8 },
+	{ ASIC_TEMP_OVER_REG, 				0xFF, 0xFF, true, 0x00, true, 0x00,  .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_BITS_8 },
+	{ TEMP_IC_OVER_FAULT_REG, 			0xFF, 0xFF, true, 0x00, false, 0x00, .status_changed_cb = vr_error_callback, .bit_check_mask = CHECK_BITS_678 },
+	{ MFIO_FOR_RAINBOW, 				0x80, 0x80, true, 0x00, true, 0x00, .status_changed_cb = asic_temp_error_callback, .bit_check_mask = CHECK_BITS_012356 },
 };
 
-bool cpld_polling_alert_status = false; // only polling cpld when alert status is true
+int power_info = 0;
+
 bool cpld_polling_enable_flag = true;
 
-void check_cpld_polling_alert_status(void)
+bool get_is_ubc_enabled()
 {
-	cpld_polling_alert_status = (gpio_get(ALL_VR_PM_ALERT_R_N) == 0);
+	bool is_ubc_enabled = false;
+	uint8_t data = 0;
+	if (!plat_read_cpld(VR_EN_PIN_READING_5, &data, 1)) {
+		LOG_ERR("Failed to read cpld reg: 0x%x", VR_EN_PIN_READING_5);
+	} else {
+		is_ubc_enabled = (data & BIT(0)) ? true : false;
+	}
+	return is_ubc_enabled;
+}
+
+void get_cpld_polling_power_info(int* reading)
+{
+	*reading = power_info;
 }
 
 void set_cpld_polling_enable_flag(bool status)
@@ -107,27 +151,18 @@ void check_ubc_delayed(struct k_work *work)
 	 * 1 -> UBC is enabled
 	 * 0 -> UBC is disabled
 	 */
-	bool is_ubc_enabled = (gpio_get(FM_PLD_UBC_EN_R) == GPIO_HIGH);
-
-	bool is_dc_on = is_mb_dc_on();
-
-	if (is_ubc_enabled) {
-		if (is_dc_on != is_ubc_enabled) {
-			//send event to bmc
-			uint16_t error_code = (POWER_ON_SEQUENCE_TRIGGER_CAUSE << 13);
-			error_log_event(error_code, LOG_ASSERT);
-			LOG_ERR("Generated error code: 0x%x", error_code);
-		}
-	}
-
+	bool is_ubc_enabled = get_is_ubc_enabled();
 	ubc_enabled_delayed_status = is_ubc_enabled;
+	if (ubc_enabled_delayed_status)
+	{
+		//enable 
+		k_timer_start(get_ubc_delaytimer(), K_MSEC(1000), K_NO_WAIT);
+	}
+}
 
-	LOG_DBG("UBC enabled delayed status: %d", ubc_enabled_delayed_status);
-
-	/* cpld tbd
-	if (is_ubc_enabled == true) {
-		k_work_submit(&vr_vout_work);
-	} */
+bool is_ubc_enabled_delayed_enabled(void)
+{
+	return ubc_enabled_delayed_status;
 }
 
 void reset_error_log_states(uint8_t err_type)
@@ -160,8 +195,8 @@ bool vr_error_callback(cpld_info *cpld_info, uint8_t *current_cpld_value)
 	if (!status_changed_bit)
 		return true; // No new faults, return early
 
-	LOG_DBG("CPLD register 0x%02X has status changed 0x%02X", cpld_info->cpld_offset,
-		status_changed_bit);
+	// LOG_DBG("CPLD register 0x%02X has status changed 0x%02X", cpld_info->cpld_offset,
+		// status_changed_bit);
 
 	// Iterate through each bit in status_changed_bit to handle the corresponding VR
 	for (uint8_t bit = 0; bit < 8; bit++) {
@@ -174,18 +209,18 @@ bool vr_error_callback(cpld_info *cpld_info, uint8_t *current_cpld_value)
 
 		uint8_t bit_val = (*current_cpld_value & BIT(bit)) >> bit;
 		uint8_t expected_bit_val = (expected_val & BIT(bit)) >> bit;
-		LOG_DBG("cpld offset 0x%02X, bit %d, bit_val %d, expected_bit_val %d",
-			cpld_info->cpld_offset, bit, bit_val, expected_bit_val);
+		// LOG_DBG("cpld offset 0x%02X, bit %d, bit_val %d, expected_bit_val %d",
+			// cpld_info->cpld_offset, bit, bit_val, expected_bit_val);
 
 		if (bit_val != expected_bit_val) {
 			LOG_ERR("Generated error code: 0x%04X (bit %d, CPLD offset 0x%02X)",
 				error_code, bit, cpld_info->cpld_offset);
 
 			// Perform additional operations if needed
-			LOG_DBG("ASSERT");
+			// LOG_DBG("ASSERT");
 			error_log_event(error_code, LOG_ASSERT);
 		} else {
-			LOG_DBG("DEASSERT");
+			// LOG_DBG("DEASSERT");
 			error_log_event(error_code, LOG_DEASSERT);
 		}
 	}
@@ -193,32 +228,227 @@ bool vr_error_callback(cpld_info *cpld_info, uint8_t *current_cpld_value)
 	return true;
 }
 
+void trigger_vr_hot()
+{
+	// set VR hot switch bit to 1
+	if (!set_cpld_bit(ASIC_VR_HOT_SWITCH, 0, 1)) {
+		LOG_ERR("Failed to write ASIC_VR_HOT_SWITCH");
+	}
+}
+
+void restore_vr_hot()
+{
+	// set VR hot switch bit to 0
+	if (!set_cpld_bit(ASIC_VR_HOT_SWITCH, 0, 0)) {
+		LOG_ERR("Failed to write ASIC_VR_HOT_SWITCH");
+	}
+}
+
+
+bool asic_temp_error_callback(cpld_info *cpld_info, uint8_t *current_cpld_value)
+{
+	CHECK_NULL_ARG_WITH_RETURN(cpld_info, false);
+	CHECK_NULL_ARG_WITH_RETURN(current_cpld_value, false);
+	// no support in evb borad
+	if (get_asic_board_id() == ASIC_BOARD_ID_EVB) {
+		return true;
+	}
+	LOG_WRN("ASIC temp error callback triggered current_cpld_value: 0x%02X", *current_cpld_value);
+	// Get the expected value based on the current UBC status
+	uint8_t expected_val =
+		ubc_enabled_delayed_status ? cpld_info->dc_on_defaut : cpld_info->dc_off_defaut;
+
+	// Calculate current faults and new faults
+	uint8_t current_fault = (*current_cpld_value ^ expected_val) & cpld_info->bit_check_mask;
+	uint8_t status_changed_bit = current_fault ^ cpld_info->is_fault_bit_map;
+
+	if (!status_changed_bit)
+		return true; // No new faults, return early
+
+	// LOG_DBG("Temp CPLD register 0x%02X has status changed 0x%02X", cpld_info->cpld_offset,
+		// status_changed_bit);
+
+	// Iterate through each bit in status_changed_bit to handle the corresponding VR
+	for (uint8_t bit = 0; bit < 8; bit++) {
+		if (!(status_changed_bit & BIT(bit)))
+			continue;
+		// Dynamically generate the error code
+		uint16_t error_code = (CPLD_UNEXPECTED_VAL_TRIGGER_CAUSE << 13) | (bit << 8) |
+				      cpld_info->cpld_offset;
+
+		uint8_t bit_val = (*current_cpld_value & BIT(bit)) >> bit;
+		uint8_t expected_bit_val = (expected_val & BIT(bit)) >> bit;
+
+		if (bit_val != expected_bit_val) {
+			LOG_ERR("ASIC TEMP: Generated error code: 0x%04X (bit %d, CPLD offset 0x%02X)",
+				error_code, bit, cpld_info->cpld_offset);
+			uint8_t error_asic_temp_code = 0;
+			uint8_t asic_send_data = 0;
+			uint8_t temp_data[ASIC_MONITOR_TEMP_REG_LEN] = { 0 };
+			if (read_asic_reg(ASIC_MONITOR_TEMP_REG, (uint8_t *)temp_data,
+					ASIC_MONITOR_TEMP_REG_LEN) != 0) {
+				LOG_ERR("Can't get max asic temp data from ASIC, reg: 0x%02x",
+					ASIC_MONITOR_TEMP_REG);
+			}
+			LOG_WRN("reg 0x%02X, bit 0x%2X, error_code 0x%04X", cpld_info->cpld_offset, bit, error_code);
+			switch (bit) {
+			case 6:
+				error_asic_temp_code = HAMSA_MFIO22_ERR_EVENT; // HAMSA_MFIO22
+				asic_send_data = temp_data[1];
+				trigger_vr_hot();
+				LOG_WRN("Temperature bit-%d is 1, write CPLD ASIC_VR_HOT_SWITCH bit-0 to 1", bit);
+				break;
+			case 3:
+				error_asic_temp_code = MEDHA0_MFIO24_ERR_EVENT; // MEDHA0_MFIO24
+				asic_send_data = temp_data[2];
+				trigger_vr_hot();
+				LOG_WRN("Temperature bit-%d is 1, write CPLD ASIC_VR_HOT_SWITCH bit-0 to 1", bit);
+				break;
+			case 1:
+				error_asic_temp_code = MEDHA1_MFIO24_ERR_EVENT; // MEDHA1_MFIO24
+				asic_send_data = temp_data[3];
+				trigger_vr_hot();
+				LOG_WRN("Temperature bit-%d is 1, write CPLD ASIC_VR_HOT_SWITCH bit-0 to 1", bit);
+				break;
+			case 5:
+				error_asic_temp_code = HAMSA_MFIO23_ERR_EVENT;
+				asic_send_data = *current_cpld_value;
+				asic_thermtrip_error_log(LOG_ASSERT);
+				break;
+			case 2:
+				error_asic_temp_code = MEDHA0_MFIO31_ERR_EVENT;
+				asic_send_data = *current_cpld_value;
+				asic_thermtrip_error_log(LOG_ASSERT);
+				break;
+			case 0:
+				error_asic_temp_code = MEDHA1_MFIO31_ERR_EVENT; 
+				asic_send_data = *current_cpld_value;
+				asic_thermtrip_error_log(LOG_ASSERT);
+				break;
+			default:
+				LOG_ERR("Unknown ASIC temp error bit: %d", bit);
+				break;
+			}
+			// black bix log
+			error_log_event(error_code, LOG_ASSERT);
+			// send log to bmc
+			packaged_bmc_log(ASIC_MODULE_ERROR, error_asic_temp_code, asic_send_data, 0);
+		} else {
+			uint8_t check_lv2_data = 0;
+			switch (bit) {
+			case 6:
+			case 3:
+			case 1:
+				// check cpld 0xA8 bit6/3/1 all clear
+				if (!plat_read_cpld(MFIO_FOR_RAINBOW, &check_lv2_data, 1)) {
+					LOG_ERR("Failed to write ASIC_VR_HOT_SWITCH");
+				}
+				if ((check_lv2_data & CHECK_BITS_631) == 0)
+					restore_vr_hot();
+			}
+		}
+	}
+
+	return true;
+}
+
+void give_all_vr_pm_alert_sem()
+{
+	k_sem_give(&all_vr_pm_alert_sem);
+	LOG_WRN("gpio give all_vr_pm_alert_sem");
+}
+
 void poll_cpld_registers()
 {
 	uint8_t data = 0;
-	bool prev_alert_status = false;
+	uint8_t board_id = get_asic_board_id();
+	uint8_t asic_rst = 0;
+	uint8_t prev_asic_rst = 0;
 
 	while (1) {
 		/* Sleep for the polling interval */
-		k_msleep(CPLD_POLLING_INTERVAL_MS);
+		k_sem_take(&all_vr_pm_alert_sem, K_FOREVER);
 
-		LOG_DBG("cpld_polling_alert_status = %d, cpld_polling_enable_flag = %d",
-			cpld_polling_alert_status, cpld_polling_enable_flag);
-
-		// Check for falling edge of cpld_polling_alert_status (true -> false)
-		if (prev_alert_status && !cpld_polling_alert_status) {
-			uint8_t err_type = CPLD_UNEXPECTED_VAL_TRIGGER_CAUSE;
-			LOG_DBG("cpld_polling_alert_status: true -> false, reset_error_log_states: %x",
-				err_type);
-			reset_error_log_states(err_type);
+		if (is_update_state_idle() == false) {
+			continue;
 		}
-		// Save current alert status for next loop comparison
-		prev_alert_status = cpld_polling_alert_status;
 
-		if (!cpld_polling_alert_status || !cpld_polling_enable_flag)
+		if (!cpld_polling_enable_flag)
 			continue;
 
-		LOG_DBG("Polling CPLD registers");
+		uint8_t pwr_value_lsb = 0;
+		uint8_t pwr_value_msb = 0;
+		if (!plat_read_cpld(CPLD_POWER_INFO_0_REG, &pwr_value_lsb, 1)){
+			LOG_ERR("LSB read from CPLD fail");
+		}
+		if (!plat_read_cpld(CPLD_POWER_INFO_1_REG, &pwr_value_msb, 1)){
+			LOG_ERR("MSB read from CPLD fail");
+		}
+		power_info = (pwr_value_msb<<8)|pwr_value_lsb;
+
+		if (get_asic_board_id() == ASIC_BOARD_ID_EVB && get_board_rev_id() >= REV_ID_EVT1B) {
+
+			if (!plat_read_cpld(CPLD_ASIC_RESET_STATUS_REG, &asic_rst, 1)) {
+				LOG_ERR("Failed to read CPLD_ASIC_RESET_STATUS_REG (0x%02X)",
+					CPLD_ASIC_RESET_STATUS_REG);
+			} else {
+				if (asic_rst != prev_asic_rst) {
+					// LOG_DBG("ASIC reset status changed: 0x%02X -> 0x%02X",
+						// prev_asic_rst, asic_rst);
+					prev_asic_rst = asic_rst;
+
+					uint8_t hamsa_pwron     = (asic_rst >> 5) & 0x1; // HAMSA_POWER_ON_RESET_PLD_L
+					uint8_t medha0_pwron    = (asic_rst >> 4) & 0x1; // MEDHA0_POWER_ON_RESET_PLD_L
+					uint8_t medha1_pwron    = (asic_rst >> 3) & 0x1; // MEDHA1_POWER_ON_RESET_PLD_L
+					uint8_t hamsa_sys_rst   = (asic_rst >> 2) & 0x1; // HAMSA_SYS_RST_PLD_L
+					uint8_t medha0_sys_rst  = (asic_rst >> 1) & 0x1; // MEDHA0_SYS_RST_PLD_L
+					uint8_t medha1_sys_rst  = (asic_rst >> 0) & 0x1; // MEDHA1_SYS_RST_PLD_L
+
+					/* -------- U200070: io0~2 <- bit5~3 --------
+					*  - io0: HAMSA_POWER_ON_RESET_PLD_L
+					*  - io1: MEDHA0_POWER_ON_RESET_PLD_L
+					*  - io2: MEDHA1_POWER_ON_RESET_PLD_L
+					*/
+					uint8_t new_070 = U200070_IO_INIT_VAL;
+
+					new_070 &= ~(BIT(0) | BIT(1) | BIT(2));
+					new_070 |= (hamsa_pwron   << 0);
+					new_070 |= (medha0_pwron  << 1);
+					new_070 |= (medha1_pwron  << 2);
+
+					set_pca6554apw_ioe_value(U200070_IO_I2C_BUS, U200070_IO_ADDR,
+								OUTPUT_PORT, new_070);
+					// LOG_DBG("Update U200070 OUTPUT_PORT: 0x%02X -> 0x%02X",
+						// U200070_IO_INIT_VAL, new_070);
+
+					/* -------- U200053: bit2 -> io6 (HAMSA_SYS_RST_PLD_L) -------- */
+					uint8_t new_053 = U200053_IO_INIT_VAL;
+
+					new_053 &= ~BIT(6);
+					new_053 |= (hamsa_sys_rst << 6);
+
+					set_pca6554apw_ioe_value(U200053_IO_I2C_BUS, U200053_IO_ADDR,
+								OUTPUT_PORT, new_053);
+					// LOG_DBG("Update U200053 OUTPUT_PORT: 0x%02X -> 0x%02X",
+						// U200053_IO_INIT_VAL, new_053);
+
+					/* -------- U200052: bit1/bit0 -> io6/io7 --------
+					*  - bit1 -> io6 (MEDHA0_SYS_RST_PLD_L)
+					*  - bit0 -> io7 (MEDHA1_SYS_RST_PLD_L)
+					*/
+					uint8_t new_052 = U200052_IO_INIT_VAL;
+
+					new_052 &= ~(BIT(6) | BIT(7));
+					new_052 |= (medha0_sys_rst << 6);
+					new_052 |= (medha1_sys_rst << 7);
+
+					set_pca6554apw_ioe_value(U200052_IO_I2C_BUS, U200052_IO_ADDR,
+								OUTPUT_PORT, new_052);
+					// LOG_DBG("Update U200052 OUTPUT_PORT: 0x%02X -> 0x%02X",
+						// U200052_IO_INIT_VAL, new_052);
+				}
+			}
+		}
 
 		for (size_t i = 0; i < ARRAY_SIZE(cpld_info_table); i++) {
 			uint8_t expected_val = ubc_enabled_delayed_status ?
@@ -227,17 +457,22 @@ void poll_cpld_registers()
 
 			// Read from CPLD
 			if (!plat_read_cpld(cpld_info_table[i].cpld_offset, &data, 1)) {
-				LOG_DBG("Failed to read CPLD register 0x%02X",
-					cpld_info_table[i].cpld_offset);
 				continue;
 			}
 
-			LOG_DBG("Polling CPLD 0x%02X raw=0x%02X, expected=0x%02X, mask=0x%02X",
-				cpld_info_table[i].cpld_offset, data, expected_val,
-				cpld_info_table[i].bit_check_mask);
+			// LOG_DBG("Polling CPLD 0x%02X raw=0x%02X, expected=0x%02X, mask=0x%02X",
+				// cpld_info_table[i].cpld_offset, data, expected_val,
+				// cpld_info_table[i].bit_check_mask);
 
 			if (!cpld_info_table[i].is_fault_log)
 				continue;
+			
+			// evb not support asic temp monitoring
+			if (get_asic_board_id() == ASIC_BOARD_ID_EVB) {
+				if (cpld_info_table[i].cpld_offset == MFIO_FOR_RAINBOW) {
+					continue;
+				}
+			}
 
 			uint8_t new_fault_map =
 				(data ^ expected_val) & cpld_info_table[i].bit_check_mask;
@@ -251,12 +486,108 @@ void poll_cpld_registers()
 					cpld_info_table[i].status_changed_cb(
 						&cpld_info_table[i], &data);
 				}
+				if (cpld_info_table[i].is_send_bmc) {
+					process_mtia_vr_power_fault_sel(&cpld_info_table[i],
+									&data);
+					set_led_flag(true);
+				}
+				if (cpld_info_table[i].cpld_offset == VR_SMBUS_ALERT_EVENT_LOG_REG) {
+					//get sensor pmbus alert status(if temperature bit-2 is 1)
+					uint8_t temp_data = 0;
+					plat_read_cpld(VR_SMBUS_ALERT_EVENT_LOG_REG, &temp_data, 1);
+					// check which VR_SMBUS_ALERT_EVENT_LOG_REG bit is changed
+					LOG_INF("VR_SMBUS_ALERT_EVENT_LOG_REG: 0x%x", temp_data);
+					for (int j = 0; j < 8; j++) {
+						if (j == 0)
+							continue; // skip bit-0
+						// if temp data is changed
+						if ((temp_data & BIT(j)) == 0)
+						{
+							LOG_WRN("SMBUS_ALERT_REG changed, bit-%d is changed", j);
+							if(!check_temp_status_bit(j))
+							{
+
+								if (board_id == ASIC_BOARD_ID_EVB) {
+									// EVB board handles VR_HOT through IO expander
+									if (!tca6424a_i2c_write_bit(TCA6424A_OUTPUT_PORT_0,
+													HAMSA_MFIO19,
+													1)) {
+										LOG_ERR("Failed to set VR_HOT (HAMSA_MFIO19) via IO expander");
+									} else {
+										LOG_WRN("Temperature bit-%d is 1, set IO exp VR_HOT (HAMSA_MFIO19) to 1", j);
+									}
+								} else {
+									// Rainbow board uses CPLD to control VR_HOT
+									if (!plat_read_cpld(ASIC_VR_HOT_SWITCH, &data, 1)) {
+										LOG_ERR("Failed to read ASIC_VR_HOT_SWITCH");
+									}
+									data |= BIT(0);
+									if (!plat_write_cpld(ASIC_VR_HOT_SWITCH, &data)) {
+										LOG_ERR("Failed to write ASIC_VR_HOT_SWITCH");
+									}
+									LOG_WRN("Temperature bit-%d is 1, write CPLD ASIC_VR_HOT_SWITCH bit-0 to 1", j);
+								}
+								set_led_flag(true);
+								break;
+							}
+						}
+					}
+				}
 				// update map
 				cpld_info_table[i].is_fault_bit_map = new_fault_map;
 				cpld_info_table[i].last_polling_value = data;
 			}
 		}
 	}
+}
+
+bool set_cpld_bit(uint8_t cpld_offset, uint8_t bit, uint8_t value)
+{
+	
+	if (bit > 8) {
+		LOG_ERR("Invalid bit index %d", bit);
+		return false;
+	}
+
+	if (value != 0 && value != 1) {
+		LOG_ERR("Invalid value %d", value);
+		return false;
+	}
+
+	uint8_t original_value = 0;
+	if (!plat_read_cpld(cpld_offset, &original_value, 1)) {
+		LOG_ERR("offset = 0x%x, bit = %d, value = %d, read cpld fail", cpld_offset,
+			   bit, value);
+		return false;
+	}
+
+	if (value) {
+		original_value |= BIT(bit);
+	} else {
+		original_value &= ~BIT(bit);
+	}
+
+	if (!plat_write_cpld(cpld_offset, &original_value)) {
+		LOG_ERR("offset = 0x%x, bit = %d, value = %d, write cpld fail",
+			   cpld_offset, bit, value);
+		return false;
+	}
+
+	// check if write success
+	uint8_t check_value = 0;
+	if (!plat_read_cpld(cpld_offset, &check_value, 1)) {
+		LOG_ERR("offset = 0x%x, bit = %d, value = %d, read cpld fail", cpld_offset,
+			   bit, value);
+		return false;
+	}
+
+	if (check_value != original_value) {
+		LOG_ERR("offset = 0x%x, bit = %d, value = %d, set_cpld_bit fail",
+			   cpld_offset, bit, value);
+		return false;
+	}
+
+	return true;
 }
 
 void check_cpld_handler()
@@ -267,18 +598,46 @@ void check_cpld_handler()
 		LOG_ERR("Failed to read cpld version from cpld");
 	}
 	version = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
-	LOG_DBG("The cpld version: %08x", version);
 
 	k_work_schedule(&check_cpld_work, K_MSEC(5000));
 }
 
 void init_cpld_polling(void)
 {
-	check_cpld_polling_alert_status();
-
+	k_timer_start(&check_ubc_delayed_timer, K_MSEC(1000), K_NO_WAIT);
+	k_sem_init(&all_vr_pm_alert_sem, 0, 1);
+	k_timer_start(&ragular_cpld_polling_sem_timer, K_MSEC(1000), K_MSEC(1000));	
 	cpld_polling_tid =
 		k_thread_create(&cpld_polling_thread, cpld_polling_stack,
 				K_THREAD_STACK_SIZEOF(cpld_polling_stack), poll_cpld_registers,
 				NULL, NULL, NULL, CONFIG_MAIN_THREAD_PRIORITY, 0, K_MSEC(1000));
 	k_thread_name_set(&cpld_polling_thread, "cpld_polling_thread");
+}
+
+void check_bootstrap_flag()
+{
+	uint8_t temp_read_value = 0;
+	if (!plat_read_cpld(VR_EN_PIN_READING_5, &temp_read_value, 1)) {
+		LOG_ERR("Failed to read VR_EN_PIN_READING_5 for checking bootstrap flag");
+		return;
+	}
+	//check bit-0 is 1 and pre_read_bootstrap_setting_value is true
+	temp_read_value = temp_read_value & 0x01;
+	if (temp_read_value == 1 && get_pre_read_bootstrap_setting_value()) {
+		LOG_ERR("PWR_EN:%d, Bootstrap setting is different, bootstrap flag: %d", temp_read_value, get_pre_read_bootstrap_setting_value());
+		uint16_t error_code = BOOTSTRAP_EVENT_CAUSE;
+		error_log_event(error_code, LOG_ASSERT);
+
+		struct pldm_addsel_data bootstrap_sel_msg = { 0 };
+		bootstrap_sel_msg.assert_type = LOG_ASSERT;
+		bootstrap_sel_msg.event_type = ASIC_MODULE_ERROR; //ASIC_MODULE_ERROR;
+		bootstrap_sel_msg.event_data_1 = BOOTSTRAP_SET_AFTER_PWR_EN;
+		bootstrap_sel_msg.event_data_2 = get_error_bootstrap_index_list(0); // error BOOTSTRAP index 0
+		bootstrap_sel_msg.event_data_3 = get_error_bootstrap_index_list(1); // error BOOTSTRAP index 1
+		if (send_event_log_to_bmc(bootstrap_sel_msg) != PLDM_SUCCESS) {
+			LOG_ERR("Failed to send bootstrap error code to bmc, event data: 0x%x 0x%x 0x%x\n",
+				bootstrap_sel_msg.event_data_1, bootstrap_sel_msg.event_data_2,
+				bootstrap_sel_msg.event_data_3);
+		}
+	}									
 }

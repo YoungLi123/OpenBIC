@@ -17,6 +17,10 @@
 #ifndef PLAT_HOOK_H
 #define PLAT_HOOK_H
 
+#include "pmbus.h"
+#include "sensor.h"
+#include "common_i2c_mux.h"
+
 typedef struct _isl69259_pre_proc_arg {
 	/* vr page to set */
 	uint8_t vr_page;
@@ -30,16 +34,44 @@ typedef struct _dimm_pre_proc_arg {
 	bool is_present_checked;
 } dimm_pre_proc_arg;
 
+typedef struct _mp5998_plat_init_arg {
+	uint16_t vin_ov_fault_limit;
+	uint16_t vin_ov_warn_limit;
+	uint16_t vin_uv_warn_limit;
+	uint16_t iin_oc_fault_limit;
+	uint16_t iin_oc_warn_limit;
+	uint16_t fault_mask;
+	uint16_t efuse_cfg;
+	uint16_t protect_en;
+} mp5998_plat_init_arg;
+typedef struct _tps53689_pre_proc_arg {
+	/* vr page to set */
+	uint8_t vr_page;
+} tps53689_pre_proc_arg;
+
+typedef struct _tps25990_plat_init_arg {
+	uint16_t vin_ov_fault_limit;
+	uint16_t vin_ov_warn_limit;
+	uint16_t vin_uv_warn_limit;
+	uint16_t vin_uv_fault_limit;
+	uint16_t iin_oc_warn_limit;
+	uint16_t protect_en;
+} tps25990_plat_init_arg;
+
 /**************************************************************************************************
  * INIT ARGS
 **************************************************************************************************/
 extern adc_asd_init_arg adc_asd_init_args[];
 extern adm1278_init_arg adm1278_init_args[];
 extern mp5990_init_arg mp5990_init_args[];
+extern mp5998_plat_init_arg mp5998_plat_init_args[];
+extern tps25990_init_arg tps25990_init_args[];
+extern tps25990_plat_init_arg tps25990_plat_init_args[];
 extern pmic_init_arg pmic_init_args[];
 extern max16550a_init_arg max16550a_init_args[];
 extern ltc4286_init_arg ltc4286_init_args[];
 extern ltc4282_init_arg ltc4282_init_args[];
+extern sq52205_init_arg sq52205_init_args[];
 
 /**************************************************************************************************
  *  PRE-HOOK/POST-HOOK ARGS
@@ -48,6 +80,9 @@ extern struct tca9548 mux_conf_addr_0xe2[];
 extern isl69259_pre_proc_arg isl69259_pre_read_args[];
 extern pmic_pre_proc_arg pmic_pre_read_args[];
 extern dimm_pre_proc_arg dimm_pre_proc_args[];
+extern ina233_init_arg ina233_init_args[];
+extern vr_page_cfg xdpe15284_page[];
+extern tps53689_pre_proc_arg tps53689_pre_read_args[];
 
 /**************************************************************************************************
  *  PRE-HOOK/POST-HOOK FUNC
@@ -58,10 +93,16 @@ bool pre_pmic_read(sensor_cfg *cfg, void *args);
 bool pre_vol_bat3v_read(sensor_cfg *cfg, void *args);
 bool pre_intel_peci_dimm_read(sensor_cfg *cfg, void *args);
 bool post_vol_bat3v_read(sensor_cfg *cfg, void *args, int *reading);
+bool post_cpu_read(sensor_cfg *cfg, void *args, int *reading);
 bool post_cpu_margin_read(sensor_cfg *cfg, void *args, int *reading);
+bool post_mp5998_voltage_read(sensor_cfg *cfg, void *args, int *reading);
+bool post_mp5998_power_read(sensor_cfg *cfg, void *args, int *reading);
 bool post_adm1278_power_read(sensor_cfg *cfg, void *args, int *reading);
 bool post_adm1278_current_read(sensor_cfg *cfg, void *args, int *reading);
 bool post_ltc4286_read(sensor_cfg *cfg, void *args, int *reading);
 bool post_ltc4282_read(sensor_cfg *cfg, void *args, int *reading);
+bool pre_xdpe15284_read(sensor_cfg *cfg, void *args);
+bool post_xdpe15284_read(sensor_cfg *cfg, void *args, int *reading);
+bool pre_tps53689_read(sensor_cfg *cfg, void *args);
 
 #endif

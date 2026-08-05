@@ -58,7 +58,17 @@ __weak void plat_pldm_sensor_post_load_init(int thread_id)
 	return;
 }
 
-bool pldm_sensor_is_interval_ready(pldm_sensor_info *pldm_sensor_list)
+__weak void plat_pldm_sensor_poll_post()
+{
+	return;
+}
+
+__weak void plat_pldm_sensor_change_poll_interval(int thread_id, uint32_t *poll_interval_ms)
+{
+	return;
+}
+
+bool pldm_sensor_is_interval_ready(pldm_sensor_info *pldm_sensor_list, uint8_t polling_time_config)
 {
 	CHECK_NULL_ARG_WITH_RETURN(pldm_sensor_list, false);
 
@@ -67,6 +77,21 @@ bool pldm_sensor_is_interval_ready(pldm_sensor_info *pldm_sensor_list)
 	}
 
 	uint32_t current_time = 0, diff_time = 0;
+	if (polling_time_config == true) {
+		if (pldm_sensor_list->update_time_ms == 0) { // First time to read sensor
+			return true;
+		}
+
+		// current_time set to ms
+		current_time = k_uptime_get_32();
+		diff_time = current_time - pldm_sensor_list->update_time_ms;
+
+		if (pldm_sensor_list->poll_interval_ms > diff_time) {
+			return false;
+		}
+
+		return true;
+	}
 
 	current_time = k_uptime_get_32() / 1000;
 	diff_time = current_time - pldm_sensor_list->update_time;
@@ -298,7 +323,10 @@ void pldm_sensor_get_reading(sensor_cfg *pldm_sensor_cfg, uint32_t *update_time,
 	if (pldm_sensor_cfg->post_sensor_read_hook) {
 		if (!pldm_sensor_cfg->post_sensor_read_hook(
 			    pldm_sensor_cfg, pldm_sensor_cfg->post_sensor_read_args, &reading)) {
-			pldm_sensor_cfg->cache_status = PLDM_SENSOR_FAILED;
+			if (pldm_sensor_cfg->cache_status == SENSOR_OPEN_CIRCUIT)
+				pldm_sensor_cfg->cache_status = PLDM_SENSOR_OPEN_CIRCUIT;
+			else
+				pldm_sensor_cfg->cache_status = PLDM_SENSOR_FAILED;
 			*update_time_ms = k_uptime_get_32();
 			*update_time = (*update_time_ms / 1000);
 			LOG_DBG("Failed to pose read sensor_num 0x%x of thread %d", sensor_num,
@@ -366,7 +394,7 @@ int pldm_sensor_polling_pre_check(pldm_sensor_info *pldm_snr_list, int sensor_nu
 
 int pldm_polling_sensor_reading_optional_check(pldm_sensor_info *pldm_snr_list,
 					       int pldm_sensor_count, int thread_id, int sensor_num,
-					       bool interval_ready_check_en)
+					       bool interval_ready_check_en, bool polling_using_ms)
 {
 	CHECK_NULL_ARG_WITH_RETURN(pldm_snr_list, -1);
 
@@ -382,7 +410,8 @@ int pldm_polling_sensor_reading_optional_check(pldm_sensor_info *pldm_snr_list,
 		return -1;
 	}
 
-	if (interval_ready_check_en && !pldm_sensor_is_interval_ready(pldm_snr_list)) {
+	if (interval_ready_check_en &&
+	    !pldm_sensor_is_interval_ready(pldm_snr_list, polling_using_ms)) {
 		return -1;
 	}
 
@@ -400,7 +429,7 @@ int pldm_polling_sensor_reading(pldm_sensor_info *pldm_snr_list, int pldm_sensor
 				int thread_id, int sensor_num)
 {
 	return pldm_polling_sensor_reading_optional_check(pldm_snr_list, pldm_sensor_count,
-							  thread_id, sensor_num, true);
+							  thread_id, sensor_num, true, false);
 }
 
 void pldm_sensor_polling_handler(void *arug0, void *arug1, void *arug2)
@@ -412,6 +441,8 @@ void pldm_sensor_polling_handler(void *arug0, void *arug1, void *arug2)
 	int thread_id = (int)arug0;
 	int pldm_sensor_count = 0;
 	uint32_t poll_interval_ms = PLDM_SENSOR_POLL_TIME_DEFAULT_MS;
+	uint8_t is_need_check = false;
+	uint8_t is_interval_using_ms = false;
 
 	pldm_sensor_count = plat_pldm_sensor_get_sensor_count(thread_id);
 	if (pldm_sensor_count <= 0) {
@@ -427,8 +458,16 @@ void pldm_sensor_polling_handler(void *arug0, void *arug1, void *arug2)
 	}
 
 	if (pldm_sensor_thread_list[thread_id].poll_interval_ms != 0) {
-		poll_interval_ms = pldm_sensor_thread_list[thread_id].poll_interval_ms;
+		if (pldm_sensor_thread_list[thread_id].poll_interval_ms == 0xFF) {
+			poll_interval_ms = 0;
+		} else {
+			poll_interval_ms = pldm_sensor_thread_list[thread_id].poll_interval_ms;
+		}
 	}
+
+	is_need_check = pldm_sensor_thread_list[thread_id].still_check_interval == 0 ? false : true;
+	is_interval_using_ms =
+		pldm_sensor_thread_list[thread_id].using_ms_polling_time == 0 ? false : true;
 
 	plat_pldm_sensor_post_load_init(thread_id);
 
@@ -438,6 +477,8 @@ void pldm_sensor_polling_handler(void *arug0, void *arug1, void *arug2)
 			k_msleep(poll_interval_ms);
 			continue;
 		}
+		// Dynamic change polling interval
+		plat_pldm_sensor_change_poll_interval(thread_id, &poll_interval_ms);
 
 		for (sensor_num = 0; sensor_num < pldm_sensor_count; sensor_num++) {
 			if (get_sensor_poll_enable_flag() == false) {
@@ -447,7 +488,8 @@ void pldm_sensor_polling_handler(void *arug0, void *arug1, void *arug2)
 			if (pldm_sensor_thread_list[thread_id].poll_interval_ms != 0) {
 				if (pldm_polling_sensor_reading_optional_check(
 					    &pldm_sensor_list[thread_id][sensor_num],
-					    pldm_sensor_count, thread_id, sensor_num, false) != 0) {
+					    pldm_sensor_count, thread_id, sensor_num, is_need_check,
+					    is_interval_using_ms) != 0) {
 					continue;
 				}
 			} else {
@@ -458,7 +500,7 @@ void pldm_sensor_polling_handler(void *arug0, void *arug1, void *arug2)
 				}
 			}
 		}
-
+		plat_pldm_sensor_poll_post();
 		k_msleep(poll_interval_ms);
 	}
 }

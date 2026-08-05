@@ -32,6 +32,8 @@
 #define I2C_DATA_SIZE 5
 #define NUMBER_OF_ADC_CHANNEL 16
 #define AST1030_ADC_BASE_ADDR 0x7e6e9000
+#define E1S_BOOT_OFFSET_CARD_PRSNT 0x10
+#define PRSNT_E1S_BOOT_BIT 2
 
 #define MAX_1OU_M2_COUNT 4
 
@@ -85,6 +87,7 @@ enum HSC_MODULE {
 	HSC_MODULE_MP5990,
 	HSC_MODULE_LTC4282,
 	HSC_MODULE_LTC4286,
+	HSC_MODULE_TPS25990,
 	HSC_MODULE_UNKNOWN,
 };
 
@@ -97,14 +100,34 @@ enum SYSTEM_SKU {
 	SYS_TYPE_EMR = 6,
 };
 
+enum VR_MODULE {
+	VR_MODULE_UNKNOWN = 0,
+	VR_MODULE_ISL69259,
+	VR_MODULE_XDPE15284D,
+	VR_MODULE_TPS53689,
+};
+
+enum E1S_BOOT_DRIVE_MODULE {
+	E1S_BOOT_DRIVE_MODULE_UNKNOWN = 0,
+	E1S_BOOT_DRIVE_MODULE_INA233,
+	E1S_BOOT_DRIVE_MODULE_SQ52205,
+};
+
 uint8_t get_system_class();
 uint8_t get_system_sku();
 CARD_STATUS get_1ou_status();
 CARD_STATUS get_2ou_status();
 uint8_t get_board_revision();
 uint8_t get_hsc_module();
+uint8_t get_vr_module(void);
+uint8_t get_e1s_boot_drive_module();
 bool get_adc_voltage(int channel, float *voltage);
 void init_hsc_module();
+void init_e1s_boot_drive_module();
 void init_platform_config();
-
+void mp5998_plat_init();
+void tps25990_plat_init();
+void set_bootdrive_exist_status();
+bool get_bootdrive_exist_status();
+uint8_t detect_vr_module_via_pmbus(void);
 #endif

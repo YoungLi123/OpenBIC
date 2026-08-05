@@ -17,6 +17,36 @@
 #ifndef _PLAT_FWUPDATE_H_
 #define _PLAT_FWUPDATE_H_
 
+#define PLAT_CRC32_READ_SIZE 128
+#define PLAT_FLASH_BOOT0_VER_OFFSET 0x1FFFF8
+
+#define RESET_CPLD_ON 0x3F
+#define RESET_CPLD_OFF 0x00
+
+#define CIP_VERSION_BYTE 0x69
+
+enum ASIC_BOOT_COMPONENT {
+	BOOT0_HAMSA,
+	BOOT0_MEDHA0,
+	BOOT0_MEDHA1,
+	BOOT1_HAMSA,
+	BOOT0_MAX,
+};
+
+enum ASIC_IMG_NUM {
+	IMG_BOOT1_HAMSA,
+	IMG_BOOT0_HAMSA,
+	IMG_BOOT0_MEDHA0,
+	IMG_BOOT0_MEDHA1,
+	IMG_UNKNOWN,
+};
+
+enum FLASH_VER_CRC {
+	VERSION,
+	CRC32,
+	MAX_VER_CRC,
+};
+
 enum FIRMWARE_COMPONENT {
 	COMPNT_BIC,
 	COMPNT_VR_1,
@@ -31,9 +61,19 @@ enum FIRMWARE_COMPONENT {
 	COMPNT_VR_10,
 	COMPNT_VR_11,
 	COMPNT_VR_12,
+	COMPNT_HAMSA,
+	COMPNT_MEDHA0,
+	COMPNT_MEDHA1,
+	COMPNT_VR_3V3,
 };
 
+void plat_set_cpld_reset_reg(uint8_t value);
 bool find_sensor_id_and_name_by_firmware_comp_id(uint8_t comp_identifier, uint8_t *sensor_id,
 						 char *sensor_name);
-
+uint32_t plat_get_image_crc_checksum(uint8_t index);
+int sb_read_block(uint8_t slv_id, uint8_t cmd, uint8_t *data, uint32_t len);
+bool plat_get_image_crc_checksum_from_flash(uint8_t index, uint32_t *data_ver, uint32_t *data_crc);
+uint32_t plat_get_image_version(uint8_t index);
+void update_temp_boot0_version(uint32_t version, uint8_t index);
+void get_fw_version_boot0_from_asic();
 #endif /* _PLAT_FWUPDATE_H_ */

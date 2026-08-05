@@ -130,28 +130,30 @@ void init_event_work()
 
 void addsel_work_handler(struct k_work *work_item)
 {
-	struct pldm_addsel_data msg = { 0 };
 	struct k_work_delayable *dwork = k_work_delayable_from_work(work_item);
-
-	const add_sel_info *work_info = CONTAINER_OF(dwork, add_sel_info, add_sel_work);
-
-	if ((work_info->gpio_num != 0) && (work_info->event_type != 0)) {
-		msg.event_type = work_info->event_type;
-		msg.assert_type = work_info->assert_type;
-	} else {
-		// for fastprochot and sys_throttle
-		const sel_work_wrapper *wrap = CONTAINER_OF(work_item, sel_work_wrapper, work);
-		if (wrap->sel_data.event_type != 0) {
-			msg = wrap->sel_data;
-		} else {
-			LOG_ERR("Invalid work item received, skip sending SEL.");
-			return;
-		}
-	}
+	add_sel_info *work_info = CONTAINER_OF(dwork, add_sel_info, add_sel_work);
+	struct pldm_addsel_data msg = { 0 };
+	msg.event_type = work_info->event_type;
+	msg.assert_type = work_info->assert_type;
 
 	if (send_event_log_to_bmc(msg) != PLDM_SUCCESS) {
-		LOG_ERR("Failed to send SEL: event_type=0x%x, assert_type=0x%x", msg.event_type,
-			msg.assert_type);
+		LOG_ERR("Failed to send event log, event type: 0x%x, assert type: 0x%x",
+			work_info->event_type, work_info->assert_type);
+	};
+}
+
+void addsel_wrapper_work_handler(struct k_work *work_item)
+{
+	sel_work_wrapper *wrap = CONTAINER_OF(work_item, sel_work_wrapper, work);
+
+	if (wrap->sel_data.event_type == 0) {
+		LOG_ERR("Invalid wrapper SEL, skip sending SEL.");
+		return;
+	}
+
+	if (send_event_log_to_bmc(wrap->sel_data) != PLDM_SUCCESS) {
+		LOG_ERR("Failed to send SEL: event_type=0x%x, assert_type=0x%x",
+			wrap->sel_data.event_type, wrap->sel_data.assert_type);
 	}
 }
 
@@ -199,12 +201,19 @@ void reinit_i3c_hub()
 	i3c_hub_type = get_i3c_hub_type();
 
 	// Initialize I3C HUB
-	if(i3c_hub_type == P3H2840_DEVICE_INFO) {
-		if (!p3h284x_i3c_mode_only_init(&i3c_msg, p3h284x_cmd_initial, P3H284X_CMD_INITIAL_SIZE)) {
+	if (i3c_hub_type == P3H2840_DEVICE_INFO) {
+		if (!p3h284x_i3c_mode_only_init(&i3c_msg, p3h284x_cmd_initial,
+						P3H284X_CMD_INITIAL_SIZE)) {
 			printk("failed to initialize 1ou p3h284x\n");
 		}
+	} else if (i3c_hub_type == RTS4902A_DEVICE_INFO) {
+		if (!rg3mxxb12_i3c_mode_only_init(&i3c_msg, rts4902a_cmd_initial,
+						  RG3MXXB12_CMD_INITIAL_SIZE)) {
+			printk("failed to initialize 1ou rts4902a\n");
+		}
 	} else {
-		if (!rg3mxxb12_i3c_mode_only_init(&i3c_msg, rg3mxxb12_cmd_initial, RG3MXXB12_CMD_INITIAL_SIZE)) {
+		if (!rg3mxxb12_i3c_mode_only_init(&i3c_msg, rg3mxxb12_cmd_initial,
+						  RG3MXXB12_CMD_INITIAL_SIZE)) {
 			printk("failed to initialize 1ou rg3mxxb12\n");
 		}
 	}
@@ -445,7 +454,7 @@ void ISR_MB_THROTTLE()
 			hw_event_register[2]++;
 		}
 		int ret = -1;
-		k_work_init_delayable(&wrap->work, addsel_work_handler);
+		k_work_init_delayable(&wrap->work, addsel_wrapper_work_handler);
 		ret = k_work_schedule_for_queue(&mb_throttle_work_q, &wrap->work, K_NO_WAIT);
 		if (ret != 1) {
 			LOG_ERR("Fail MB_THROTTLE Kwork failed, %d", ret);
@@ -493,7 +502,7 @@ void ISR_SYS_THROTTLE()
 			hw_event_register[4]++;
 		}
 		int ret = -1;
-		k_work_init_delayable(&wrap->work, addsel_work_handler);
+		k_work_init_delayable(&wrap->work, addsel_wrapper_work_handler);
 		ret = k_work_schedule_for_queue(&sys_throttle_work_q, &wrap->work, K_NO_WAIT);
 		if (ret != 1) {
 			LOG_ERR("Fail SYS_THROTTLE Kwork failed, %d", ret);
@@ -730,7 +739,7 @@ void ISR_VR_PWR_FAULT()
 	LOG_INF("VR power fault event triggered");
 	hw_event_register[7]++;
 	k_work_schedule_for_queue(&plat_work_q, &vr_event_work_item[0].add_sel_work,
-					K_MSEC(VR_EVENT_DELAY_MS));
+				  K_MSEC(VR_EVENT_DELAY_MS));
 }
 
 void ISR_UV_DETECT()

@@ -20,6 +20,9 @@
 #include "plat_log.h"
 #include "plat_fru.h"
 #include "plat_cpld.h"
+#include "plat_user_setting.h"
+#include "shell_plat_power_sequence.h"
+#include "plat_hook.h"
 
 typedef struct {
 	uint8_t cpld_offset;
@@ -31,8 +34,8 @@ const cpld_bit_name_table_t cpld_bit_name_table[] = {
 	{ VR_POWER_FAULT_1_REG,
 	  "VR Power Fault   (1:Power Fault, 0=Normal)",
 	  {
-		  "RSVD",
-		  "RSVD",
+		  "P0V75_AVDD_HCSL",
+		  "P4V2",
 		  "HAMSA_VDDHRXTX_PCIE",
 		  "HAMSA_AVDD_PCIE",
 		  "OWL_W_TRVDD0P75",
@@ -87,7 +90,79 @@ const cpld_bit_name_table_t cpld_bit_name_table[] = {
 		  "P3V3",
 		  "P5V",
 		  "P12V_UBC_PWRGD",
-	  } }
+	  } },
+	{ LEAK_DETECT_REG,
+	  "Leak Detection",
+	  {
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "LEAK_DETECT_ALERT_CPLD_N",
+		  "RSVD",
+	  } },
+	{ VR_SMBUS_ALERT_EVENT_LOG_REG,
+	  "VR SMBALRT , Status",
+	  {
+		  "RSVD",
+		  "MAX_N_VDDRXTX_SMBALRT_N",
+		  "VDDQC_VDDQL_0246_SMBALRT_N",
+		  "MAX_M_VDDQC_1357_SMBALRT_N",
+		  "OWL_W_SMBALRT_N",
+		  "OWL_E_SMBALRT_N",
+		  "MEDHA1_VDD_ALERT_R_N",
+		  "MEDHA0_VDD_ALERT_R_N",
+	  } },
+	{ HBM_CATTRIP_REG,
+	  "HBM CATTRIP, Event log",
+	  {
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "MEDHA1_HBM_CATTRIP_LS_LVC33_ALARM (1-->0)",
+		  "MEDHA0_HBM_CATTRIP_LS_LVC33_ALARM (1-->0)",
+	  } },
+	{ SYSTEM_ALERT_FAULT_REG,
+	  "System Alert Fault, Event log",
+	  {
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "FM_MODULE_PWRBRK_R_N (MB CPLD to Rainbow CPLD) (1-->0)",
+	  } },
+	{ ASIC_TEMP_OVER_REG,
+	  "ASIC TEMP OVER, Event log",
+	  {
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "FM_ASIC_0_THERMTRIP_N (1-->0)",
+	  } },
+	{ TEMP_IC_OVER_FAULT_REG,
+	  "Temperature IC OVERT fault, Event log",
+	  {
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "RSVD",
+		  "IRQ_TMP75_3_ALERT_R_N (1-->0)",
+		  "IRQ_TMP75_2_ALERT_R_N (1-->0)",
+		  "IRQ_TMP75_1_ALERT_R_N (1-->0)",
+	  } },
 };
 
 const char *get_cpld_reg_name(uint8_t cpld_offset)
@@ -151,39 +226,201 @@ void cmd_log_dump(const struct shell *shell, size_t argc, char **argv)
 
 		uint8_t cpld_offset = log.err_code & 0xFF;
 		uint8_t bit_position = (log.err_code >> 8) & 0x07;
+		uint8_t clk_idx = log.err_code & 0x0F;
 
 		const char *reg_name = get_cpld_reg_name(cpld_offset);
 		const char *bit_name = get_cpld_bit_name(cpld_offset, bit_position);
 
+		shell_print(shell, "sys_time: %lld ms", log.sys_time);
+		uint8_t err_data_len = 2; //sizeof(log.error_data)
+		uint16_t extend_case = log.err_code & 0xFF00;
 		switch (err_type) {
 		case CPLD_UNEXPECTED_VAL_TRIGGER_CAUSE:
-			shell_print(shell, "\t%s", reg_name);
-			shell_print(shell, "\t\t%s", bit_name);
+			if (extend_case == BOOTSTRAP_EVENT_CAUSE) {
+				shell_print(shell, "\tBOOTSTRAP_DIFFERENT");
+				shell_print(
+					shell,
+					"Bootstrap setting index list (index with value different):");
+				uint8_t *bootstrap_name = NULL;
+
+				for (int j = 0; j < 8; j++) {
+					uint8_t bootstrap_index = log.error_data[j];
+					if (bootstrap_index < STRAP_INDEX_MAX) {
+						//show index and name
+						strap_name_get((uint8_t)bootstrap_index,
+							       &bootstrap_name);
+						shell_print(shell, "\tindex: %d, name: %s",
+							    bootstrap_index, bootstrap_name);
+					} else {
+						err_data_len = j;
+						break;
+					}
+				}
+			} else if (extend_case == CLOCK_APLL_UNLOCK_EVENT_CAUSE) {
+				switch (clk_idx) {
+				case CLK_100MHZ_ERR_IDX:
+					shell_print(shell, "\t100MHz CLOCK_APLL_UNLOCK");
+					shell_print(shell,
+						    "read 100MHz clock APLL lock status: 0x%02x",
+						    log.error_data[0]);
+					err_data_len = 1;
+					break;
+				case CLK_312_5MHZ_ERR_IDX:
+					shell_print(shell, "\t312.5MHz CLOCK_APLL_UNLOCK");
+					shell_print(shell,
+						    "read 312.5MHz clock APLL lock status: 0x%02x",
+						    log.error_data[0]);
+					err_data_len = 1;
+					break;
+				case CLK_BUF0_100M_LOSB_PLD:
+					shell_print(shell, "\tCLK_BUF0_100M_LOSB_PLD");
+					shell_print(shell, "read cpld reg 0x31: 0x%02x",
+						    log.error_data[0]);
+					err_data_len = 1;
+					break;
+				case CLK_BUF1_100M_LOSB_PLD:
+					shell_print(shell, "\tCLK_BUF1_100M_LOSB_PLD");
+					shell_print(shell, "read cpld reg 0x31: 0x%02x",
+						    log.error_data[0]);
+					err_data_len = 1;
+					break;
+				case CLK_BUF2_100M_LOSB_PLD:
+					shell_print(shell, "\tCLK_BUF2_100M_LOSB_PLD");
+					shell_print(shell, "read cpld reg 0x31: 0x%02x",
+						    log.error_data[0]);
+					err_data_len = 1;
+					break;
+				case CLK_312_5MHZ_REINIT_ERR_IDX:
+					shell_print(shell, "\tCLK_312_5MHZ_REINIT_ERR");
+					shell_print(
+						shell,
+						"read re-init event data: 0x00A8(4 bytes), 0x0080(1 byte), 0x0088(2 bytes)");
+					err_data_len = 7;
+					break;
+				default:
+					break;
+				}
+			} else if (cpld_offset == MFIO_FOR_RAINBOW) {
+				shell_print(shell, "\tASIC_REMOTE_TEMP_ERROR");
+				switch (bit_position) {
+				case HAMSA_MFIO22:
+					shell_print(shell, "\tHAMSA_MFIO22");
+					err_data_len = 2;
+					break;
+				case MEDHA0_MFIO24:
+					shell_print(shell, "\tMEDHA0_MFIO24");
+					err_data_len = 2;
+					break;
+				case MEDHA1_MFIO24:
+					shell_print(shell, "\tMEDHA1_MFIO24");
+					err_data_len = 2;
+					break;
+				case HAMSA_MFIO23:
+					shell_print(shell, "\tHAMSA_MFIO23");
+					err_data_len = 1;
+					break;
+				case MEDHA0_MFIO31:
+					shell_print(shell, "\tMEDHA0_MFIO31");
+					err_data_len = 1;
+					break;
+				case MEDHA1_MFIO31:
+					shell_print(shell, "\tMEDHA1_MFIO31");
+					err_data_len = 1;
+					break;
+				default:
+					break;
+				}
+				shell_print(shell, "cpld offset(0x%x): 0x%02x", MFIO_FOR_RAINBOW,
+					    log.error_data[0]);
+				shell_print(shell, "asic temp data: 0x%02x", log.error_data[1]);
+			} else {
+				shell_print(shell, "\t%s", reg_name);
+				shell_print(shell, "\t\t%s", bit_name);
+				shell_print(shell, "read vr sensor status word(0x79):");
+				shell_print(shell, "\tlow  byte: 0x%02x", log.error_data[0]);
+				shell_print(shell, "\thigh byte: 0x%02x", log.error_data[1]);
+			}
 			break;
 		case POWER_ON_SEQUENCE_TRIGGER_CAUSE:
-			shell_print(shell, "\tPOWER_ON_SEQUENCE_TRIGGER");
+			shell_print(shell, "\tPOWER_ON_SEQUENCE_FAILURE");
+			err_data_len = 1;
+			uint8_t *name = NULL;
+			uint8_t sensor_num = get_pwrgd_sequence_fail_sensor_num(log.error_data[0]);
+			plat_get_power_seq_pwrgd_event_fail_name(log.error_data[0], &name);
+			shell_print(shell, "RAIL: %s", name);
+			if (sensor_num != NO_SENSOR_NUM) {
+				shell_print(shell, "read vr sensor status word(0x79):");
+				shell_print(shell, "\tlow  byte: 0x%02x", log.error_data[7]);
+				shell_print(shell, "\thigh byte: 0x%02x", log.error_data[8]);
+			}
+			shell_print(
+				shell,
+				"PWRGD REG(start from 0xBE): 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x",
+				log.error_data[1], log.error_data[2], log.error_data[3],
+				log.error_data[4], log.error_data[5], log.error_data[6]);
 			break;
 		case AC_ON_TRIGGER_CAUSE:
 			shell_print(shell, "\tAC_ON");
+			err_data_len = 1;
 			break;
 		case DC_ON_TRIGGER_CAUSE:
 			shell_print(shell, "\tDC_ON_DETECTED");
+			err_data_len = 1;
+			break;
+		case TEMPERATURE_TRIGGER_CAUSE:
+			shell_print(shell, "\tTEMPERATURE_TRIGGER");
+			uint8_t temp_sensor_num = log.err_code & 0xFF;
+			//find name in temp_index_table
+			for (int j = 0; j < TEMP_INDEX_MAX; j++) {
+				if (temp_sensor_num == temp_index_table[j].sensor_id) {
+					shell_print(shell, "\t\t%s",
+						    temp_index_table[j].sensor_name);
+					shell_print(shell, "sensor_num 0x%02x status(02h): 0x%02x",
+						    log.error_data[2], log.error_data[0]);
+					// check whether the open status
+					if (log.error_data[0] & BIT(2))
+						shell_print(
+							shell,
+							"sensor_num 0x%02x open status(1Bh): 0x%02x",
+							log.error_data[2], log.error_data[1]);
+					else if (log.error_data[0] & BIT(4))
+						shell_print(
+							shell,
+							"high limit trigger, status(35h): 0x%02x",
+							log.error_data[1]);
+					else if (log.error_data[0] & BIT(3))
+						shell_print(
+							shell,
+							"low limit trigger, status(36h): 0x%02x",
+							log.error_data[1]);
+					err_data_len = 3;
+					break;
+				}
+			}
+			break;
+		case ASIC_THERMTRIP_TRIGGER_CAUSE:
+			shell_print(shell, "\tASIC_THERMTRIP_TRIGGER");
+			shell_print(shell, "read cpld offset(0x27): 0x%02x", log.error_data[0]);
+			shell_print(shell, "read cpld offset(0x29): 0x%02x", log.error_data[1]);
+			break;
+		case ASIC_ERROR_TRIGGER_CAUSE:
+			shell_print(shell, "\tASIC_ERROR_TRIGGER");
+			shell_print(shell, "event_id:   0x%02x%02x", log.error_data[1],
+				    log.error_data[0]);
+			shell_print(shell, "chiplet_id: 0x%02x", log.error_data[2]);
+			shell_print(shell, "module_id:  0x%02x", log.error_data[3]);
+			err_data_len = 4;
 			break;
 		default:
 			shell_print(shell, "Unknown error type: %d", err_type);
 			break;
 		}
 
-		shell_print(shell, "sys_time: %lld ms", log.sys_time);
 		shell_print(shell, "error_data:");
-		shell_hexdump(shell, log.error_data, sizeof(log.error_data));
+		shell_hexdump(shell, log.error_data, err_data_len);
 		shell_print(shell, "cpld register: start offset 0x%02x",
 			    CPLD_REGISTER_1ST_PART_START_OFFSET);
 		shell_hexdump(shell, log.cpld_dump, CPLD_REGISTER_1ST_PART_NUM);
-		shell_print(shell, "cpld register: start offset 0x%02x",
-			    CPLD_REGISTER_2ND_PART_START_OFFSET);
-		shell_hexdump(shell, log.cpld_dump + CPLD_REGISTER_1ST_PART_NUM,
-			      CPLD_REGISTER_2ND_PART_NUM);
 		shell_print(
 			shell,
 			"====================================================================================");

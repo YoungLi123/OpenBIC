@@ -17,11 +17,16 @@
 #include "pmbus.h"
 #include "sensor.h"
 #include "tmp431.h"
+#include "emc1413.h"
 #include "pldm_sensor.h"
 #include "plat_hook.h"
 #include "plat_i2c.h"
 #include "plat_util.h"
 #include "plat_class.h"
+#include "shell_plat_average_power.h"
+#include "plat_power_capping.h"
+#include "plat_pldm_fw_update.h"
+#include "plat_gpio.h"
 
 LOG_MODULE_REGISTER(plat_pldm_sensor);
 
@@ -29,28 +34,34 @@ static bool plat_sensor_polling_enable_flag = true;
 static bool plat_sensor_ubc_polling_enable_flag = true;
 static bool plat_sensor_temp_polling_enable_flag = true;
 static bool plat_sensor_vr_polling_enable_flag = true;
+static uint8_t plat_sensor_one_step_power_enable_flag = 0;
+
+uint8_t pwr_capping_pollng_rate_type = 0;
 
 static struct pldm_sensor_thread pal_pldm_sensor_thread[MAX_SENSOR_THREAD_ID] = {
 	// thread id, thread name
 	{ TEMP_SENSOR_THREAD_ID, "TEMP_SENSOR_THREAD" },
 	{ VR_SENSOR_THREAD_ID, "VR_PLDM_SENSOR_THREAD" },
-	{ QUICK_VR_SENSOR_THREAD_ID, "QUICK_VR_PLDM_SENSOR_THREAD", 10 },
+	{ QUICK_VR_SENSOR_THREAD_ID, "QUICK_VR_PLDM_SENSOR_THREAD", QUICK_POLL_INTERVAL, true,
+	  true },
 	{ UBC_SENSOR_THREAD_ID, "UBC_PLDM_SENSOR_THREAD" },
+	{ EVB_SENSOR_THREAD_ID, "EVB_SENSOR_THREAD" },
 };
 
 extern vr_pre_proc_arg vr_pre_read_args[];
-
+extern mpc12109_init_arg mpc12109_init_args[];
+uint8_t ioe_init_flag = 0;
 static bool is_quick_vr_sensor(uint8_t sensor_num)
 {
 	switch (sensor_num) {
 	case SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_VOLT_V:
-	case SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_CURR_A:
 	case SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_PWR_W:
 	case SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_VOLT_V:
-	case SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_CURR_A:
 	case SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_PWR_W:
-	case SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_VOLT_V:
-	case SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_CURR_A:
+	case SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_PWR_W:
+	case SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_PWR_W:
+	case SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_PWR_W:
+	case SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_PWR_W:
 	case SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_PWR_W:
 		return true;
 	}
@@ -58,40 +69,94 @@ static bool is_quick_vr_sensor(uint8_t sensor_num)
 }
 
 typedef struct {
-	uint8_t orig_addr;
-	uint8_t rns_addr;
+	uint8_t orig_addr; // old MPS
+	uint8_t rns_addr; // old rns
+	uint8_t rb_FAB2_evb_FAB3_mps_addr; // new mps
+	uint8_t rb_FAB2_evb_FAB3_rns_addr; // new rns
 } addr_map_t;
 
 static const addr_map_t addr_map_table[] = {
-	{ ASIC_P0V85_MEDHA0_VDD_ADDR, ASIC_P0V85_MEDHA0_VDD_RNS_ADDR },
-	{ ASIC_P0V85_MEDHA1_VDD_ADDR, ASIC_P0V85_MEDHA1_VDD_RNS_ADDR },
-	{ ASIC_P0V9_OWL_E_TRVDD_ADDR, ASIC_P0V9_OWL_E_TRVDD_RNS_ADDR },
-	{ ASIC_P0V75_OWL_E_TRVDD_ADDR, ASIC_P0V75_OWL_E_TRVDD_RNS_ADDR },
-	{ ASIC_P0V75_MAX_M_VDD_ADDR, ASIC_P0V75_MAX_M_VDD_RNS_ADDR },
-	{ ASIC_P0V75_VDDPHY_HBM1357_ADDR, ASIC_P0V75_VDDPHY_HBM1357_RNS_ADDR },
-	{ ASIC_P0V75_OWL_E_VDD_ADDR, ASIC_P0V75_OWL_E_VDD_RNS_ADDR },
-	{ ASIC_P0V4_VDDQL_HBM1357_ADDR, ASIC_P0V4_VDDQL_HBM1357_RNS_ADDR },
-	{ ASIC_P1V1_VDDQC_HBM1357_ADDR, ASIC_P1V1_VDDQC_HBM1357_RNS_ADDR },
-	{ ASIC_P1V8_VPP_HBM1357_ADDR, ASIC_P1V8_VPP_HBM1357_RNS_ADDR },
-	{ ASIC_P0V75_MAX_N_VDD_ADDR, ASIC_P0V75_MAX_N_VDD_RNS_ADDR },
-	{ ASIC_P0V8_HAMSA_AVDD_PCIE_ADDR, ASIC_P0V8_HAMSA_AVDD_PCIE_RNS_ADDR },
-	{ ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_ADDR, ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_RNS_ADDR },
-	{ ASIC_P0V85_HAMSA_VDD_ADDR, ASIC_P0V85_HAMSA_VDD_RNS_ADDR },
-	{ ASIC_P1V1_VDDQC_HBM0246_ADDR, ASIC_P1V1_VDDQC_HBM0246_RNS_ADDR },
-	{ ASIC_P1V8_VPP_HBM0246_ADDR, ASIC_P1V8_VPP_HBM0246_RNS_ADDR },
-	{ ASIC_P0V4_VDDQL_HBM0246_ADDR, ASIC_P0V4_VDDQL_HBM0246_RNS_ADDR },
-	{ ASIC_P0V75_VDDPHY_HBM0246_ADDR, ASIC_P0V75_VDDPHY_HBM0246_RNS_ADDR },
-	{ ASIC_P0V75_OWL_W_VDD_ADDR, ASIC_P0V75_OWL_W_VDD_RNS_ADDR },
-	{ ASIC_P0V75_MAX_S_VDD_ADDR, ASIC_P0V75_MAX_S_VDD_RNS_ADDR },
-	{ ASIC_P0V9_OWL_W_TRVDD_ADDR, ASIC_P0V9_OWL_W_TRVDD_RNS_ADDR },
-	{ ASIC_P0V75_OWL_W_TRVDD_ADDR, ASIC_P0V75_OWL_W_TRVDD_RNS_ADDR },
+	{ ASIC_P0V85_MEDHA0_VDD_ADDR, ASIC_P0V85_MEDHA0_VDD_RNS_ADDR, NEW_MPS_P0V85_MEDHA0_VDD_ADDR,
+	  NEW_RNS_P0V85_MEDHA0_VDD_ADDR },
+
+	{ ASIC_P0V85_MEDHA1_VDD_ADDR, ASIC_P0V85_MEDHA1_VDD_RNS_ADDR, NEW_MPS_P0V85_MEDHA1_VDD_ADDR,
+	  NEW_RNS_P0V85_MEDHA1_VDD_ADDR },
+
+	{ ASIC_P0V9_OWL_E_TRVDD_ADDR, ASIC_P0V9_OWL_E_TRVDD_RNS_ADDR, NEW_MPS_P0V9_OWL_E_TRVDD_ADDR,
+	  NEW_RNS_P0V9_OWL_E_TRVDD_ADDR },
+
+	{ ASIC_P0V75_OWL_E_TRVDD_ADDR, ASIC_P0V75_OWL_E_TRVDD_RNS_ADDR,
+	  NEW_MPS_P0V75_OWL_E_TRVDD_ADDR, NEW_RNS_P0V75_OWL_E_TRVDD_ADDR },
+
+	{ ASIC_P0V75_MAX_M_VDD_ADDR, ASIC_P0V75_MAX_M_VDD_RNS_ADDR, NEW_MPS_P0V75_MAX_M_VDD_ADDR,
+	  NEW_RNS_P0V75_MAX_M_VDD_ADDR },
+
+	{ ASIC_P0V75_VDDPHY_HBM1357_ADDR, ASIC_P0V75_VDDPHY_HBM1357_RNS_ADDR,
+	  NEW_MPS_P0V75_VDDPHY_HBM1357_ADDR, NEW_RNS_P0V75_VDDPHY_HBM1357_ADDR },
+
+	{ ASIC_P0V75_OWL_E_VDD_ADDR, ASIC_P0V75_OWL_E_VDD_RNS_ADDR, NEW_MPS_P0V75_OWL_E_VDD_ADDR,
+	  NEW_RNS_P0V75_OWL_E_VDD_ADDR },
+
+	{ ASIC_P0V4_VDDQL_HBM1357_ADDR, ASIC_P0V4_VDDQL_HBM1357_RNS_ADDR,
+	  NEW_MPS_P0V4_VDDQL_HBM1357_ADDR, NEW_RNS_P0V4_VDDQL_HBM1357_ADDR },
+
+	{ ASIC_P1V1_VDDQC_HBM1357_ADDR, ASIC_P1V1_VDDQC_HBM1357_RNS_ADDR,
+	  NEW_MPS_P1V1_VDDQC_HBM1357_ADDR, NEW_RNS_P1V1_VDDQC_HBM1357_ADDR },
+
+	{ ASIC_P1V8_VPP_HBM1357_ADDR, ASIC_P1V8_VPP_HBM1357_RNS_ADDR, NEW_MPS_P1V8_VPP_HBM1357_ADDR,
+	  NEW_RNS_P1V8_VPP_HBM1357_ADDR },
+
+	{ ASIC_P0V75_MAX_N_VDD_ADDR, ASIC_P0V75_MAX_N_VDD_RNS_ADDR, NEW_MPS_P0V75_MAX_N_VDD_ADDR,
+	  NEW_RNS_P0V75_MAX_N_VDD_ADDR },
+
+	{ ASIC_P0V8_HAMSA_AVDD_PCIE_ADDR, ASIC_P0V8_HAMSA_AVDD_PCIE_RNS_ADDR,
+	  NEW_MPS_P0V8_HAMSA_AVDD_PCIE_ADDR, NEW_RNS_P0V8_HAMSA_AVDD_PCIE_ADDR },
+
+	{ ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_ADDR, ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_RNS_ADDR,
+	  NEW_MPS_P1V2_HAMSA_VDDHRXTX_PCIE_ADDR, NEW_RNS_P1V2_HAMSA_VDDHRXTX_PCIE_ADDR },
+
+	{ ASIC_P0V85_HAMSA_VDD_ADDR, ASIC_P0V85_HAMSA_VDD_RNS_ADDR, NEW_MPS_P0V85_HAMSA_VDD_ADDR,
+	  NEW_RNS_P0V85_HAMSA_VDD_ADDR },
+
+	{ ASIC_P1V1_VDDQC_HBM0246_ADDR, ASIC_P1V1_VDDQC_HBM0246_RNS_ADDR,
+	  NEW_MPS_P1V1_VDDQC_HBM0246_ADDR, NEW_RNS_P1V1_VDDQC_HBM0246_ADDR },
+
+	{ ASIC_P1V8_VPP_HBM0246_ADDR, ASIC_P1V8_VPP_HBM0246_RNS_ADDR, NEW_MPS_P1V8_VPP_HBM0246_ADDR,
+	  NEW_RNS_P1V8_VPP_HBM0246_ADDR },
+
+	{ ASIC_P0V4_VDDQL_HBM0246_ADDR, ASIC_P0V4_VDDQL_HBM0246_RNS_ADDR,
+	  NEW_MPS_P0V4_VDDQL_HBM0246_ADDR, NEW_RNS_P0V4_VDDQL_HBM0246_ADDR },
+
+	{ ASIC_P0V75_VDDPHY_HBM0246_ADDR, ASIC_P0V75_VDDPHY_HBM0246_RNS_ADDR,
+	  NEW_MPS_P0V75_VDDPHY_HBM0246_ADDR, NEW_RNS_P0V75_VDDPHY_HBM0246_ADDR },
+
+	{ ASIC_P0V75_OWL_W_VDD_ADDR, ASIC_P0V75_OWL_W_VDD_RNS_ADDR, NEW_MPS_P0V75_OWL_W_VDD_ADDR,
+	  NEW_RNS_P0V75_OWL_W_VDD_ADDR },
+
+	{ ASIC_P0V75_MAX_S_VDD_ADDR, ASIC_P0V75_MAX_S_VDD_RNS_ADDR, NEW_MPS_P0V75_MAX_S_VDD_ADDR,
+	  NEW_RNS_P0V75_MAX_S_VDD_ADDR },
+
+	{ ASIC_P0V9_OWL_W_TRVDD_ADDR, ASIC_P0V9_OWL_W_TRVDD_RNS_ADDR, NEW_MPS_P0V9_OWL_W_TRVDD_ADDR,
+	  NEW_RNS_P0V9_OWL_W_TRVDD_ADDR },
+
+	{ ASIC_P0V75_OWL_W_TRVDD_ADDR, ASIC_P0V75_OWL_W_TRVDD_RNS_ADDR,
+	  NEW_MPS_P0V75_OWL_W_TRVDD_ADDR, NEW_RNS_P0V75_OWL_W_TRVDD_ADDR },
 };
 
-uint8_t convert_addr_to_rns(uint8_t addr)
+uint8_t convert_vr_addr(uint8_t addr, uint8_t vr_change_mode)
 {
 	for (int i = 0; i < ARRAY_SIZE(addr_map_table); i++) {
 		if (addr_map_table[i].orig_addr == addr) {
-			return addr_map_table[i].rns_addr;
+			if (vr_change_mode == OLD_RNS)
+				return addr_map_table[i].rns_addr;
+			else if (vr_change_mode == NEW_RNS)
+				return addr_map_table[i].rb_FAB2_evb_FAB3_rns_addr;
+			else if (vr_change_mode == NEW_MPS)
+				return addr_map_table[i].rb_FAB2_evb_FAB3_mps_addr;
+			else if (vr_change_mode == OLD_MPS)
+				LOG_DBG("don't need to change VR address");
+			else
+				LOG_ERR("vr_change_mode: 0x%x error", vr_change_mode);
 		}
 	}
 	return addr;
@@ -111,6 +176,9 @@ uint8_t check_sensor_type(uint8_t sensor_num)
 
 	if (sensor_num <= SENSOR_NUM_UBC2_P52V_INPUT_VOLT_V)
 		return UBC_SENSOR_THREAD_ID;
+
+	if (sensor_num <= SENSOR_NUM_P3V3_OSFP_PWR_W)
+		return EVB_SENSOR_THREAD_ID;
 
 	return MAX_SENSOR_THREAD_ID;
 }
@@ -182,6 +250,7 @@ pldm_sensor_info plat_pldm_sensor_temp_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_common_sensor_read,
 		},
 	},
 	{
@@ -250,6 +319,7 @@ pldm_sensor_info plat_pldm_sensor_temp_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_common_sensor_read,
 		},
 	},
 	{
@@ -318,6 +388,7 @@ pldm_sensor_info plat_pldm_sensor_temp_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_common_sensor_read,
 		},
 	},
 	{
@@ -386,6 +457,7 @@ pldm_sensor_info plat_pldm_sensor_temp_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_tmp432_read,
 		},
 	},
 	{
@@ -454,6 +526,7 @@ pldm_sensor_info plat_pldm_sensor_temp_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_tmp432_read,
 		},
 	},
 	{
@@ -522,6 +595,7 @@ pldm_sensor_info plat_pldm_sensor_temp_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_tmp432_read,
 		},
 	},
 	{
@@ -590,6 +664,7 @@ pldm_sensor_info plat_pldm_sensor_temp_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_tmp432_read,
 		},
 	},
 	{
@@ -658,6 +733,7 @@ pldm_sensor_info plat_pldm_sensor_temp_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_tmp432_read,
 		},
 	},
 	{
@@ -726,6 +802,7 @@ pldm_sensor_info plat_pldm_sensor_temp_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_tmp432_read,
 		},
 	},
 	{
@@ -794,6 +871,7 @@ pldm_sensor_info plat_pldm_sensor_temp_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_tmp432_read,
 		},
 	},
 	{
@@ -862,6 +940,7 @@ pldm_sensor_info plat_pldm_sensor_temp_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_tmp432_read,
 		},
 	},
 };
@@ -917,7 +996,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -937,6 +1016,222 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_2 * 2],
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_2 * 2],
+		},
+	},
+	{
+		{
+			// ASIC_P0V85_MEDHA0_VDD_CURR_A
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_CURR_A, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_CURR_A, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x06, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			1450000, //uint32_t critical_high;
+			0, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_CURR_A,
+			.type = sensor_dev_mp29816a,
+			.port = I2C_BUS2,
+			.target_addr = ASIC_P0V85_MEDHA0_VDD_ADDR,
+			.offset = PMBUS_READ_IOUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_2 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_2 * 2],
+		},
+	},
+	{
+		{
+			// SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_INPUT_VOLT_V,
+			.type = sensor_dev_mp29816a,
+			.port = I2C_BUS2,
+			.target_addr = ASIC_P0V85_MEDHA0_VDD_ADDR,
+			.offset = PMBUS_READ_VIN,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_2 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_2 * 2],
+		},
+	},
+	{
+		{
+			// ASIC_P0V85_MEDHA1_VDD_CURR_A
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_CURR_A, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_CURR_A, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x06, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			1450000, //uint32_t critical_high;
+			0, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_CURR_A,
+			.type = sensor_dev_mp29816a,
+			.port = I2C_BUS2,
+			.target_addr = ASIC_P0V85_MEDHA1_VDD_ADDR,
+			.offset = PMBUS_READ_IOUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_1 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_1 * 2],
 		},
 	},
 	{
@@ -989,7 +1284,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -1001,6 +1296,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.port = I2C_BUS2,
 			.target_addr = ASIC_P0V85_MEDHA1_VDD_ADDR,
 			.offset = PMBUS_READ_TEMPERATURE_1,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_1 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_1 * 2],
+		},
+	},
+	{
+		{
+			// SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_INPUT_VOLT_V,
+			.type = sensor_dev_mp29816a,
+			.port = I2C_BUS2,
+			.target_addr = ASIC_P0V85_MEDHA1_VDD_ADDR,
+			.offset = PMBUS_READ_VIN,
 			.access_checker = is_vr_access,
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
@@ -1061,7 +1428,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -1205,7 +1572,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			26500, //uint32_t critical_high;
+			16000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -1277,7 +1644,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			25400, //uint32_t critical_high;
+			15300, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -1289,6 +1656,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.port = I2C_BUS2,
 			.target_addr = ASIC_P0V9_OWL_E_TRVDD_ADDR,
 			.offset = PMBUS_READ_POUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_3 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_3 * 2],
+		},
+	},
+	{
+		{
+			// ASIC_P0V9_OWL_E_TRVDD_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V9_OWL_E_TRVDD_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V9_OWL_E_TRVDD_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V9_OWL_E_TRVDD_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS2,
+			.target_addr = ASIC_P0V9_OWL_E_TRVDD_ADDR,
+			.offset = PMBUS_READ_VIN,
 			.access_checker = is_vr_access,
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
@@ -1349,7 +1788,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -1421,7 +1860,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			796, //uint32_t critical_high;
+			795, //uint32_t critical_high;
 			705, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -1493,7 +1932,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			15000, //uint32_t critical_high;
+			9000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -1565,7 +2004,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			12000, //uint32_t critical_high;
+			6750, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -1585,6 +2024,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_3 * 2 + 1],
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_3 * 2 + 1],
+		},
+	},
+	{
+		{
+			// ASIC_P0V75_OWL_E_TRVDD_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V75_OWL_E_TRVDD_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V75_OWL_E_TRVDD_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V75_OWL_E_TRVDD_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS2,
+			.target_addr = ASIC_P0V75_OWL_E_TRVDD_ADDR,
+			.offset = PMBUS_READ_VIN,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_3 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_3 * 2],
 		},
 	},
 	{
@@ -1637,7 +2148,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -1709,8 +2220,8 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			811, //uint32_t critical_high;
-			691, //uint32_t critical_low;
+			810, //uint32_t critical_high;
+			690, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -1781,7 +2292,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			97570, //uint32_t critical_high;
+			150000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -1805,7 +2316,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 	},
 	{
 		{
-			// ASIC_P0V75_OWL_E_VDD_PWR_W
+			// ASIC_P0V75_OWL_E_VDD_INPUT_VOLT_V
 			/*** PDR common header***/
 			{
 				0x00000000, //uint32_t record_handle
@@ -1817,13 +2328,13 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 
 			/***numeric sensor format***/
 			0x0000, //uint16_t PLDM_terminus_handle;
-			SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_PWR_W, //uint16_t sensor_id;
+			SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_INPUT_VOLT_V, //uint16_t sensor_id;
 			0x0000, //uint16_t entity_type; //Need to check
-			SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_PWR_W, //uint16_t entity_instance_number;
+			SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_INPUT_VOLT_V, //uint16_t entity_instance_number;
 			0x0000, //uint16_t container_id;
 			0x00, //uint8_t sensor_init; //Need to check
 			0x01, //uint8_t sensor_auxiliary_names_pdr;
-			0x07, //uint8_t base_unit;  //unit
+			0x05, //uint8_t base_unit;  //unit
 			-3, //int8_t unit_modifier; //Need to check
 			0x00, //uint8_t rate_unit;
 			0x00, //uint8_t base_oem_unit_handle;
@@ -1840,7 +2351,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00, //uint8_t plus_tolerance;
 			0x00, //uint8_t minus_tolerance;
 			0x00000000, //uint32_t hysteresis;
-			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
 			0x00, //uint8_t threshold_and_hysteresis_volatility;
 			0, //real32_t state_transition_interval;
 			UPDATE_INTERVAL_1S, //real32_t update_interval;
@@ -1853,18 +2364,18 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			79520, //uint32_t critical_high;
-			0, //uint32_t critical_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
 		.update_time = 0,
 		{
-			.num = SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_PWR_W,
+			.num = SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_INPUT_VOLT_V,
 			.type = sensor_dev_mp2971,
 			.port = I2C_BUS2,
 			.target_addr = ASIC_P0V75_OWL_E_VDD_ADDR,
-			.offset = PMBUS_READ_POUT,
+			.offset = PMBUS_READ_VIN,
 			.access_checker = is_vr_access,
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
@@ -1925,7 +2436,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -2069,7 +2580,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			26500, //uint32_t critical_high;
+			16000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -2141,7 +2652,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			25400, //uint32_t critical_high;
+			15300, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -2153,6 +2664,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.port = I2C_BUS3,
 			.target_addr = ASIC_P0V9_OWL_W_TRVDD_ADDR,
 			.offset = PMBUS_READ_POUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_12 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_12 * 2],
+		},
+	},
+	{
+		{
+			// ASIC_P0V9_OWL_W_TRVDD_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V9_OWL_W_TRVDD_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V9_OWL_W_TRVDD_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V9_OWL_W_TRVDD_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS3,
+			.target_addr = ASIC_P0V9_OWL_W_TRVDD_ADDR,
+			.offset = PMBUS_READ_VIN,
 			.access_checker = is_vr_access,
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
@@ -2213,7 +2796,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -2285,7 +2868,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			796, //uint32_t critical_high;
+			795, //uint32_t critical_high;
 			705, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -2357,7 +2940,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			15000, //uint32_t critical_high;
+			9000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -2429,7 +3012,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			12000, //uint32_t critical_high;
+			6750, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -2449,6 +3032,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_12 * 2 + 1],
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_12 * 2 + 1],
+		},
+	},
+	{
+		{
+			// ASIC_P0V75_OWL_W_TRVDD_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V75_OWL_W_TRVDD_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V75_OWL_W_TRVDD_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V75_OWL_W_TRVDD_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS3,
+			.target_addr = ASIC_P0V75_OWL_W_TRVDD_ADDR,
+			.offset = PMBUS_READ_VIN,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_12 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_12 * 2],
 		},
 	},
 	{
@@ -2501,7 +3156,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -2573,8 +3228,8 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			811, //uint32_t critical_high;
-			691, //uint32_t critical_low;
+			810, //uint32_t critical_high;
+			690, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -2645,7 +3300,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			97570, //uint32_t critical_high;
+			150000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -2669,7 +3324,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 	},
 	{
 		{
-			// ASIC_P0V75_OWL_W_VDD_PWR_W
+			// ASIC_P0V75_OWL_W_VDD_INPUT_VOLT_V
 			/*** PDR common header***/
 			{
 				0x00000000, //uint32_t record_handle
@@ -2681,13 +3336,13 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 
 			/***numeric sensor format***/
 			0x0000, //uint16_t PLDM_terminus_handle;
-			SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_PWR_W, //uint16_t sensor_id;
+			SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_INPUT_VOLT_V, //uint16_t sensor_id;
 			0x0000, //uint16_t entity_type; //Need to check
-			SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_PWR_W, //uint16_t entity_instance_number;
+			SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_INPUT_VOLT_V, //uint16_t entity_instance_number;
 			0x0000, //uint16_t container_id;
 			0x00, //uint8_t sensor_init; //Need to check
 			0x01, //uint8_t sensor_auxiliary_names_pdr;
-			0x07, //uint8_t base_unit;  //unit
+			0x05, //uint8_t base_unit;  //unit
 			-3, //int8_t unit_modifier; //Need to check
 			0x00, //uint8_t rate_unit;
 			0x00, //uint8_t base_oem_unit_handle;
@@ -2704,7 +3359,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00, //uint8_t plus_tolerance;
 			0x00, //uint8_t minus_tolerance;
 			0x00000000, //uint32_t hysteresis;
-			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
 			0x00, //uint8_t threshold_and_hysteresis_volatility;
 			0, //real32_t state_transition_interval;
 			UPDATE_INTERVAL_1S, //real32_t update_interval;
@@ -2717,18 +3372,18 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			79520, //uint32_t critical_high;
-			0, //uint32_t critical_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
 		.update_time = 0,
 		{
-			.num = SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_PWR_W,
+			.num = SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_INPUT_VOLT_V,
 			.type = sensor_dev_mp2971,
 			.port = I2C_BUS3,
 			.target_addr = ASIC_P0V75_OWL_W_VDD_ADDR,
-			.offset = PMBUS_READ_POUT,
+			.offset = PMBUS_READ_VIN,
 			.access_checker = is_vr_access,
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
@@ -2789,7 +3444,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -2861,8 +3516,8 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			811, //uint32_t critical_high;
-			691, //uint32_t critical_low;
+			848, //uint32_t critical_high;
+			690, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -2933,7 +3588,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			37500, //uint32_t critical_high;
+			57000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -3005,7 +3660,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			30560, //uint32_t critical_high;
+			42750, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -3017,6 +3672,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.port = I2C_BUS2,
 			.target_addr = ASIC_P0V75_MAX_M_VDD_ADDR,
 			.offset = PMBUS_READ_POUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_4 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_4 * 2],
+		},
+	},
+	{
+		{
+			// ASIC_P0V75_MAX_M_VDD_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V75_MAX_M_VDD_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V75_MAX_M_VDD_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V75_MAX_M_VDD_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS2,
+			.target_addr = ASIC_P0V75_MAX_M_VDD_ADDR,
+			.offset = PMBUS_READ_VIN,
 			.access_checker = is_vr_access,
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
@@ -3077,7 +3804,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -3149,8 +3876,8 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			811, //uint32_t critical_high;
-			691, //uint32_t critical_low;
+			848, //uint32_t critical_high;
+			690, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -3221,7 +3948,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			37500, //uint32_t critical_high;
+			57000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -3293,7 +4020,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			30560, //uint32_t critical_high;
+			42750, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -3305,6 +4032,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.port = I2C_BUS3,
 			.target_addr = ASIC_P0V75_MAX_N_VDD_ADDR,
 			.offset = PMBUS_READ_POUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_7 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_7 * 2],
+		},
+	},
+	{
+		{
+			// ASIC_P0V75_MAX_N_VDD_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V75_MAX_N_VDD_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V75_MAX_N_VDD_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V75_MAX_N_VDD_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS3,
+			.target_addr = ASIC_P0V75_MAX_N_VDD_ADDR,
+			.offset = PMBUS_READ_VIN,
 			.access_checker = is_vr_access,
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
@@ -3365,7 +4164,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -3437,8 +4236,8 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			811, //uint32_t critical_high;
-			691, //uint32_t critical_low;
+			848, //uint32_t critical_high;
+			690, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -3509,7 +4308,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			37500, //uint32_t critical_high;
+			48000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -3581,7 +4380,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			30560, //uint32_t critical_high;
+			36000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -3601,6 +4400,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_11 * 2 + 1],
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_11 * 2 + 1],
+		},
+	},
+	{
+		{
+			// ASIC_P0V75_MAX_S_VDD_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V75_MAX_S_VDD_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V75_MAX_S_VDD_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V75_MAX_S_VDD_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS3,
+			.target_addr = ASIC_P0V75_MAX_S_VDD_ADDR,
+			.offset = PMBUS_READ_VIN,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_11 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_11 * 2],
 		},
 	},
 	{
@@ -3653,7 +4524,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -3725,8 +4596,8 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			865, //uint32_t critical_high;
-			737, //uint32_t critical_low;
+			880, //uint32_t critical_high;
+			770, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -3797,7 +4668,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			28000, //uint32_t critical_high;
+			40000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -3869,7 +4740,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			24340, //uint32_t critical_high;
+			32000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -3889,6 +4760,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_7 * 2 + 1],
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_7 * 2 + 1],
+		},
+	},
+	{
+		{
+			// ASIC_P0V8_HAMSA_AVDD_PCIE_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V8_HAMSA_AVDD_PCIE_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V8_HAMSA_AVDD_PCIE_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V8_HAMSA_AVDD_PCIE_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS3,
+			.target_addr = ASIC_P0V8_HAMSA_AVDD_PCIE_ADDR,
+			.offset = PMBUS_READ_VIN,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_7 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_7 * 2],
 		},
 	},
 	{
@@ -3941,7 +4884,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -4013,8 +4956,8 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			1298, //uint32_t critical_high;
-			1105, //uint32_t critical_low;
+			1272, //uint32_t critical_high;
+			1128, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -4083,9 +5026,9 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t nominal_value;
 			0x00000000, //uint32_t normal_max;
 			0x00000000, //uint32_t normal_min;
-			21500, //uint32_t warning_high;
+			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			0, //uint32_t critical_high;
+			9000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -4157,7 +5100,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			28040, //uint32_t critical_high;
+			10800, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -4169,6 +5112,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.port = I2C_BUS3,
 			.target_addr = ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_ADDR,
 			.offset = PMBUS_READ_POUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_8 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_8 * 2],
+		},
+	},
+	{
+		{
+			// ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS3,
+			.target_addr = ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_ADDR,
+			.offset = PMBUS_READ_VIN,
 			.access_checker = is_vr_access,
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
@@ -4229,7 +5244,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -4249,6 +5264,222 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_8 * 2 + 1],
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_8 * 2 + 1],
+		},
+	},
+	{
+		{
+			// ASIC_P0V85_HAMSA_VDD_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			918, //uint32_t critical_high;
+			782, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS3,
+			.target_addr = ASIC_P0V85_HAMSA_VDD_ADDR,
+			.offset = PMBUS_READ_VOUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_8 * 2 + 1],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_8 * 2 + 1],
+		},
+	},
+	{
+		{
+			// ASIC_P0V85_HAMSA_VDD_CURR_A
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_CURR_A, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_CURR_A, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x06, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			75000, //uint32_t critical_high;
+			0, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_CURR_A,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS3,
+			.target_addr = ASIC_P0V85_HAMSA_VDD_ADDR,
+			.offset = PMBUS_READ_IOUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_8 * 2 + 1],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_8 * 2 + 1],
+		},
+	},
+	{
+		{
+			// SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS3,
+			.target_addr = ASIC_P0V85_HAMSA_VDD_ADDR,
+			.offset = PMBUS_READ_VIN,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_8 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_8 * 2],
 		},
 	},
 	{
@@ -4301,7 +5532,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -4445,7 +5676,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			72660, //uint32_t critical_high;
+			113000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -4517,7 +5748,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			58050, //uint32_t critical_high;
+			84750, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -4537,6 +5768,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_10 * 2 + 1],
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_10 * 2 + 1],
+		},
+	},
+	{
+		{
+			// ASIC_P0V75_VDDPHY_HBM0246_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM0246_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM0246_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM0246_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS3,
+			.target_addr = ASIC_P0V75_VDDPHY_HBM0246_ADDR,
+			.offset = PMBUS_READ_VIN,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_10 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_10 * 2],
 		},
 	},
 	{
@@ -4589,7 +5892,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -4661,8 +5964,8 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			424, //uint32_t critical_high;
-			376, //uint32_t critical_low;
+			440, //uint32_t critical_high;
+			380, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -4733,7 +6036,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			25800, //uint32_t critical_high;
+			31000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -4805,7 +6108,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			11000, //uint32_t critical_high;
+			12400, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -4817,6 +6120,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.port = I2C_BUS3,
 			.target_addr = ASIC_P0V4_VDDQL_HBM0246_ADDR,
 			.offset = PMBUS_READ_POUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_10 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_10 * 2],
+		},
+	},
+	{
+		{
+			// ASIC_P0V4_VDDQL_HBM0246_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V4_VDDQL_HBM0246_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V4_VDDQL_HBM0246_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V4_VDDQL_HBM0246_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS3,
+			.target_addr = ASIC_P0V4_VDDQL_HBM0246_ADDR,
+			.offset = PMBUS_READ_VIN,
 			.access_checker = is_vr_access,
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
@@ -4877,7 +6252,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -4949,8 +6324,8 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			1166, //uint32_t critical_high;
-			1035, //uint32_t critical_low;
+			1177, //uint32_t critical_high;
+			1067, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -5021,7 +6396,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			234780, //uint32_t critical_high;
+			270000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -5045,7 +6420,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 	},
 	{
 		{
-			// ASIC_P1V1_VDDQC_HBM0246_PWR_W
+			// ASIC_P1V1_VDDQC_HBM0246_INPUT_VOLT_V
 			/*** PDR common header***/
 			{
 				0x00000000, //uint32_t record_handle
@@ -5057,13 +6432,13 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 
 			/***numeric sensor format***/
 			0x0000, //uint16_t PLDM_terminus_handle;
-			SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_PWR_W, //uint16_t sensor_id;
+			SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_INPUT_VOLT_V, //uint16_t sensor_id;
 			0x0000, //uint16_t entity_type; //Need to check
-			SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_PWR_W, //uint16_t entity_instance_number;
+			SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_INPUT_VOLT_V, //uint16_t entity_instance_number;
 			0x0000, //uint16_t container_id;
 			0x00, //uint8_t sensor_init; //Need to check
 			0x01, //uint8_t sensor_auxiliary_names_pdr;
-			0x07, //uint8_t base_unit;  //unit
+			0x05, //uint8_t base_unit;  //unit
 			-3, //int8_t unit_modifier; //Need to check
 			0x00, //uint8_t rate_unit;
 			0x00, //uint8_t base_oem_unit_handle;
@@ -5080,7 +6455,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00, //uint8_t plus_tolerance;
 			0x00, //uint8_t minus_tolerance;
 			0x00000000, //uint32_t hysteresis;
-			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
 			0x00, //uint8_t threshold_and_hysteresis_volatility;
 			0, //real32_t state_transition_interval;
 			UPDATE_INTERVAL_1S, //real32_t update_interval;
@@ -5093,18 +6468,18 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			275120, //uint32_t critical_high;
-			0, //uint32_t critical_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
 		.update_time = 0,
 		{
-			.num = SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_PWR_W,
+			.num = SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_INPUT_VOLT_V,
 			.type = sensor_dev_mp2971,
 			.port = I2C_BUS3,
 			.target_addr = ASIC_P1V1_VDDQC_HBM0246_ADDR,
-			.offset = PMBUS_READ_POUT,
+			.offset = PMBUS_READ_VIN,
 			.access_checker = is_vr_access,
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
@@ -5165,7 +6540,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -5237,8 +6612,8 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			1909, //uint32_t critical_high;
-			1693, //uint32_t critical_low;
+			1950, //uint32_t critical_high;
+			1746, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -5309,7 +6684,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			13400, //uint32_t critical_high;
+			13000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -5381,7 +6756,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			25700, //uint32_t critical_high;
+			23400, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -5401,6 +6776,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_9 * 2 + 1],
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_9 * 2 + 1],
+		},
+	},
+	{
+		{
+			// ASIC_P1V8_VPP_HBM0246_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P1V8_VPP_HBM0246_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P1V8_VPP_HBM0246_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P1V8_VPP_HBM0246_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS3,
+			.target_addr = ASIC_P1V8_VPP_HBM0246_ADDR,
+			.offset = PMBUS_READ_VIN,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_9 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_9 * 2],
 		},
 	},
 	{
@@ -5453,7 +6900,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -5597,7 +7044,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			72660, //uint32_t critical_high;
+			113000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -5669,7 +7116,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			58050, //uint32_t critical_high;
+			84750, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -5689,6 +7136,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_4 * 2 + 1],
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_4 * 2 + 1],
+		},
+	},
+	{
+		{
+			// ASIC_P0V75_VDDPHY_HBM1357_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM1357_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM1357_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM1357_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS2,
+			.target_addr = ASIC_P0V75_VDDPHY_HBM1357_ADDR,
+			.offset = PMBUS_READ_VIN,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_4 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_4 * 2],
 		},
 	},
 	{
@@ -5741,7 +7260,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -5813,8 +7332,8 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			424, //uint32_t critical_high;
-			376, //uint32_t critical_low;
+			440, //uint32_t critical_high;
+			380, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -5885,7 +7404,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			25800, //uint32_t critical_high;
+			31000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -5957,7 +7476,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			11000, //uint32_t critical_high;
+			12400, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -5977,6 +7496,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_5 * 2 + 1],
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_5 * 2 + 1],
+		},
+	},
+	{
+		{
+			// ASIC_P0V4_VDDQL_HBM1357_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V4_VDDQL_HBM1357_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V4_VDDQL_HBM1357_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V4_VDDQL_HBM1357_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS2,
+			.target_addr = ASIC_P0V4_VDDQL_HBM1357_ADDR,
+			.offset = PMBUS_READ_VIN,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_5 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_5 * 2],
 		},
 	},
 	{
@@ -6029,7 +7620,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -6101,8 +7692,8 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			1166, //uint32_t critical_high;
-			1035, //uint32_t critical_low;
+			1177, //uint32_t critical_high;
+			1067, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -6173,7 +7764,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			234780, //uint32_t critical_high;
+			270000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -6197,7 +7788,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 	},
 	{
 		{
-			// ASIC_P1V1_VDDQC_HBM1357_PWR_W
+			// ASIC_P1V1_VDDQC_HBM1357_INPUT_VOLT_V
 			/*** PDR common header***/
 			{
 				0x00000000, //uint32_t record_handle
@@ -6209,13 +7800,13 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 
 			/***numeric sensor format***/
 			0x0000, //uint16_t PLDM_terminus_handle;
-			SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_PWR_W, //uint16_t sensor_id;
+			SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_INPUT_VOLT_V, //uint16_t sensor_id;
 			0x0000, //uint16_t entity_type; //Need to check
-			SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_PWR_W, //uint16_t entity_instance_number;
+			SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_INPUT_VOLT_V, //uint16_t entity_instance_number;
 			0x0000, //uint16_t container_id;
 			0x00, //uint8_t sensor_init; //Need to check
 			0x01, //uint8_t sensor_auxiliary_names_pdr;
-			0x07, //uint8_t base_unit;  //unit
+			0x05, //uint8_t base_unit;  //unit
 			-3, //int8_t unit_modifier; //Need to check
 			0x00, //uint8_t rate_unit;
 			0x00, //uint8_t base_oem_unit_handle;
@@ -6232,7 +7823,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00, //uint8_t plus_tolerance;
 			0x00, //uint8_t minus_tolerance;
 			0x00000000, //uint32_t hysteresis;
-			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
 			0x00, //uint8_t threshold_and_hysteresis_volatility;
 			0, //real32_t state_transition_interval;
 			UPDATE_INTERVAL_1S, //real32_t update_interval;
@@ -6245,18 +7836,18 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			275120, //uint32_t critical_high;
-			0, //uint32_t critical_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
 		.update_time = 0,
 		{
-			.num = SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_PWR_W,
+			.num = SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_INPUT_VOLT_V,
 			.type = sensor_dev_mp2971,
 			.port = I2C_BUS2,
 			.target_addr = ASIC_P1V1_VDDQC_HBM1357_ADDR,
-			.offset = PMBUS_READ_POUT,
+			.offset = PMBUS_READ_VIN,
 			.access_checker = is_vr_access,
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
@@ -6317,7 +7908,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			100000, //uint32_t critical_high;
+			110000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -6389,8 +7980,8 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			1909, //uint32_t critical_high;
-			1693, //uint32_t critical_low;
+			1950, //uint32_t critical_high;
+			1746, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -6461,7 +8052,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			13400, //uint32_t critical_high;
+			13000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -6533,7 +8124,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			25700, //uint32_t critical_high;
+			23400, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -6553,6 +8144,78 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_6 * 2 + 1],
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_6 * 2 + 1],
+		},
+	},
+	{
+		{
+			// ASIC_P1V8_VPP_HBM1357_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P1V8_VPP_HBM1357_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P1V8_VPP_HBM1357_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P1V8_VPP_HBM1357_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS2,
+			.target_addr = ASIC_P1V8_VPP_HBM1357_ADDR,
+			.offset = PMBUS_READ_VIN,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_6 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_6 * 2],
 		},
 	},
 };
@@ -6608,8 +8271,8 @@ pldm_sensor_info plat_pldm_sensor_quick_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			917, //uint32_t critical_high;
-			786, //uint32_t critical_low;
+			918, //uint32_t critical_high;
+			782, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -6629,78 +8292,7 @@ pldm_sensor_info plat_pldm_sensor_quick_vr_table[] = {
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_2 * 2],
 		},
-	},
-	{
-		{
-			// ASIC_P0V85_MEDHA0_VDD_CURR_A
-			/*** PDR common header***/
-			{
-				0x00000000, //uint32_t record_handle
-				0x01, //uint8_t PDR_header_version
-				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
-				0x0000, //uint16_t record_change_number
-				0x0000, //uint16_t data_length
-			},
-
-			/***numeric sensor format***/
-			0x0000, //uint16_t PLDM_terminus_handle;
-			SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_CURR_A, //uint16_t sensor_id;
-			0x0000, //uint16_t entity_type; //Need to check
-			SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_CURR_A, //uint16_t entity_instance_number;
-			0x0000, //uint16_t container_id;
-			0x00, //uint8_t sensor_init; //Need to check
-			0x01, //uint8_t sensor_auxiliary_names_pdr;
-			0x06, //uint8_t base_unit;  //unit
-			-3, //int8_t unit_modifier; //Need to check
-			0x00, //uint8_t rate_unit;
-			0x00, //uint8_t base_oem_unit_handle;
-			0x00, //uint8_t aux_unit;
-			0x00, //int8_t aux_unit_modifier;
-			0x00, //uint8_t auxrate_unit;
-			0x00, //uint8_t rel;
-			0x00, //uint8_t aux_oem_unit_handle;
-			0x00, //uint8_t is_linear;
-			0x4, //uint8_t sensor_data_size;
-			1, //real32_t resolution;
-			0, //real32_t offset;
-			0x0000, //uint16_t accuracy;
-			0x00, //uint8_t plus_tolerance;
-			0x00, //uint8_t minus_tolerance;
-			0x00000000, //uint32_t hysteresis;
-			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
-			0x00, //uint8_t threshold_and_hysteresis_volatility;
-			0, //real32_t state_transition_interval;
-			UPDATE_INTERVAL_1S, //real32_t update_interval;
-			0x00000000, //uint32_t max_readable; //Need to check
-			0x00000000, //uint32_t min_readable;
-			0x04, //uint8_t range_field_format;
-			0x00, //uint8_t range_field_support; //Need to check
-			0x00000000, //uint32_t nominal_value;
-			0x00000000, //uint32_t normal_max;
-			0x00000000, //uint32_t normal_min;
-			0, //uint32_t warning_high;
-			0, //uint32_t warning_low;
-			1253700, //uint32_t critical_high;
-			0, //uint32_t critical_low;
-			0, //uint32_t fatal_high;
-			0, //uint32_t fatal_low;
-		},
-		.update_time = 0,
-		{
-			.num = SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_CURR_A,
-			.type = sensor_dev_mp29816a,
-			.port = I2C_BUS2,
-			.target_addr = ASIC_P0V85_MEDHA0_VDD_ADDR,
-			.offset = PMBUS_READ_IOUT,
-			.access_checker = is_vr_access,
-			.sample_count = SAMPLE_COUNT_DEFAULT,
-			.cache = 0,
-			.cache_status = PLDM_SENSOR_INITIALIZING,
-			.pre_sensor_read_hook = pre_vr_read,
-			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_2 * 2],
-			.post_sensor_read_hook = post_vr_read,
-			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_2 * 2],
-		},
+		.poll_interval_ms = 1000, //1000ms
 	},
 	{
 		{
@@ -6741,8 +8333,8 @@ pldm_sensor_info plat_pldm_sensor_quick_vr_table[] = {
 			0x00000000, //uint32_t hysteresis;
 			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
 			0x00, //uint8_t threshold_and_hysteresis_volatility;
-			0, //real32_t state_transition_interval;
-			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			UPDATE_INTERVAL_1S, //real32_t state_transition_interval;
+			0, //real32_t update_interval;
 			0x00000000, //uint32_t max_readable; //Need to check
 			0x00000000, //uint32_t min_readable;
 			0x04, //uint8_t range_field_format;
@@ -6752,7 +8344,7 @@ pldm_sensor_info plat_pldm_sensor_quick_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			1155000, //uint32_t critical_high;
+			1232500, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -6773,6 +8365,7 @@ pldm_sensor_info plat_pldm_sensor_quick_vr_table[] = {
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_2 * 2],
 		},
+		.poll_interval_ms = 10, //1000ms
 	},
 	{
 		{
@@ -6824,8 +8417,8 @@ pldm_sensor_info plat_pldm_sensor_quick_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			917, //uint32_t critical_high;
-			786, //uint32_t critical_low;
+			918, //uint32_t critical_high;
+			782, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -6845,78 +8438,7 @@ pldm_sensor_info plat_pldm_sensor_quick_vr_table[] = {
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_1 * 2],
 		},
-	},
-	{
-		{
-			// ASIC_P0V85_MEDHA1_VDD_CURR_A
-			/*** PDR common header***/
-			{
-				0x00000000, //uint32_t record_handle
-				0x01, //uint8_t PDR_header_version
-				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
-				0x0000, //uint16_t record_change_number
-				0x0000, //uint16_t data_length
-			},
-
-			/***numeric sensor format***/
-			0x0000, //uint16_t PLDM_terminus_handle;
-			SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_CURR_A, //uint16_t sensor_id;
-			0x0000, //uint16_t entity_type; //Need to check
-			SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_CURR_A, //uint16_t entity_instance_number;
-			0x0000, //uint16_t container_id;
-			0x00, //uint8_t sensor_init; //Need to check
-			0x01, //uint8_t sensor_auxiliary_names_pdr;
-			0x06, //uint8_t base_unit;  //unit
-			-3, //int8_t unit_modifier; //Need to check
-			0x00, //uint8_t rate_unit;
-			0x00, //uint8_t base_oem_unit_handle;
-			0x00, //uint8_t aux_unit;
-			0x00, //int8_t aux_unit_modifier;
-			0x00, //uint8_t auxrate_unit;
-			0x00, //uint8_t rel;
-			0x00, //uint8_t aux_oem_unit_handle;
-			0x00, //uint8_t is_linear;
-			0x4, //uint8_t sensor_data_size;
-			1, //real32_t resolution;
-			0, //real32_t offset;
-			0x0000, //uint16_t accuracy;
-			0x00, //uint8_t plus_tolerance;
-			0x00, //uint8_t minus_tolerance;
-			0x00000000, //uint32_t hysteresis;
-			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
-			0x00, //uint8_t threshold_and_hysteresis_volatility;
-			0, //real32_t state_transition_interval;
-			UPDATE_INTERVAL_1S, //real32_t update_interval;
-			0x00000000, //uint32_t max_readable; //Need to check
-			0x00000000, //uint32_t min_readable;
-			0x04, //uint8_t range_field_format;
-			0x00, //uint8_t range_field_support; //Need to check
-			0x00000000, //uint32_t nominal_value;
-			0x00000000, //uint32_t normal_max;
-			0x00000000, //uint32_t normal_min;
-			0, //uint32_t warning_high;
-			0, //uint32_t warning_low;
-			1253700, //uint32_t critical_high;
-			0, //uint32_t critical_low;
-			0, //uint32_t fatal_high;
-			0, //uint32_t fatal_low;
-		},
-		.update_time = 0,
-		{
-			.num = SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_CURR_A,
-			.type = sensor_dev_mp29816a,
-			.port = I2C_BUS2,
-			.target_addr = ASIC_P0V85_MEDHA1_VDD_ADDR,
-			.offset = PMBUS_READ_IOUT,
-			.access_checker = is_vr_access,
-			.sample_count = SAMPLE_COUNT_DEFAULT,
-			.cache = 0,
-			.cache_status = PLDM_SENSOR_INITIALIZING,
-			.pre_sensor_read_hook = pre_vr_read,
-			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_1 * 2],
-			.post_sensor_read_hook = post_vr_read,
-			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_1 * 2],
-		},
+		.poll_interval_ms = 1000, //1000ms
 	},
 	{
 		{
@@ -6968,7 +8490,7 @@ pldm_sensor_info plat_pldm_sensor_quick_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			1155000, //uint32_t critical_high;
+			1232500, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -6989,10 +8511,11 @@ pldm_sensor_info plat_pldm_sensor_quick_vr_table[] = {
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_1 * 2],
 		},
+		.poll_interval_ms = 10, //10ms
 	},
 	{
 		{
-			// ASIC_P0V85_HAMSA_VDD_VOLT_V
+			// ASIC_P1V1_VDDQC_HBM0246_PWR_W
 			/*** PDR common header***/
 			{
 				0x00000000, //uint32_t record_handle
@@ -7004,85 +8527,13 @@ pldm_sensor_info plat_pldm_sensor_quick_vr_table[] = {
 
 			/***numeric sensor format***/
 			0x0000, //uint16_t PLDM_terminus_handle;
-			SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_VOLT_V, //uint16_t sensor_id;
+			SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_PWR_W, //uint16_t sensor_id;
 			0x0000, //uint16_t entity_type; //Need to check
-			SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_VOLT_V, //uint16_t entity_instance_number;
+			SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_PWR_W, //uint16_t entity_instance_number;
 			0x0000, //uint16_t container_id;
 			0x00, //uint8_t sensor_init; //Need to check
 			0x01, //uint8_t sensor_auxiliary_names_pdr;
-			0x05, //uint8_t base_unit;  //unit
-			-3, //int8_t unit_modifier; //Need to check
-			0x00, //uint8_t rate_unit;
-			0x00, //uint8_t base_oem_unit_handle;
-			0x00, //uint8_t aux_unit;
-			0x00, //int8_t aux_unit_modifier;
-			0x00, //uint8_t auxrate_unit;
-			0x00, //uint8_t rel;
-			0x00, //uint8_t aux_oem_unit_handle;
-			0x00, //uint8_t is_linear;
-			0x4, //uint8_t sensor_data_size;
-			1, //real32_t resolution;
-			0, //real32_t offset;
-			0x0000, //uint16_t accuracy;
-			0x00, //uint8_t plus_tolerance;
-			0x00, //uint8_t minus_tolerance;
-			0x00000000, //uint32_t hysteresis;
-			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
-			0x00, //uint8_t threshold_and_hysteresis_volatility;
-			0, //real32_t state_transition_interval;
-			UPDATE_INTERVAL_1S, //real32_t update_interval;
-			0x00000000, //uint32_t max_readable; //Need to check
-			0x00000000, //uint32_t min_readable;
-			0x04, //uint8_t range_field_format;
-			0x00, //uint8_t range_field_support; //Need to check
-			0x00000000, //uint32_t nominal_value;
-			0x00000000, //uint32_t normal_max;
-			0x00000000, //uint32_t normal_min;
-			0, //uint32_t warning_high;
-			0, //uint32_t warning_low;
-			919, //uint32_t critical_high;
-			783, //uint32_t critical_low;
-			0, //uint32_t fatal_high;
-			0, //uint32_t fatal_low;
-		},
-		.update_time = 0,
-		{
-			.num = SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_VOLT_V,
-			.type = sensor_dev_mp2971,
-			.port = I2C_BUS3,
-			.target_addr = ASIC_P0V85_HAMSA_VDD_ADDR,
-			.offset = PMBUS_READ_VOUT,
-			.access_checker = is_vr_access,
-			.sample_count = SAMPLE_COUNT_DEFAULT,
-			.cache = 0,
-			.cache_status = PLDM_SENSOR_INITIALIZING,
-			.pre_sensor_read_hook = pre_vr_read,
-			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_8 * 2 + 1],
-			.post_sensor_read_hook = post_vr_read,
-			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_8 * 2 + 1],
-		},
-	},
-	{
-		{
-			// ASIC_P0V85_HAMSA_VDD_CURR_A
-			/*** PDR common header***/
-			{
-				0x00000000, //uint32_t record_handle
-				0x01, //uint8_t PDR_header_version
-				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
-				0x0000, //uint16_t record_change_number
-				0x0000, //uint16_t data_length
-			},
-
-			/***numeric sensor format***/
-			0x0000, //uint16_t PLDM_terminus_handle;
-			SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_CURR_A, //uint16_t sensor_id;
-			0x0000, //uint16_t entity_type; //Need to check
-			SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_CURR_A, //uint16_t entity_instance_number;
-			0x0000, //uint16_t container_id;
-			0x00, //uint8_t sensor_init; //Need to check
-			0x01, //uint8_t sensor_auxiliary_names_pdr;
-			0x06, //uint8_t base_unit;  //unit
+			0x07, //uint8_t base_unit;  //unit
 			-3, //int8_t unit_modifier; //Need to check
 			0x00, //uint8_t rate_unit;
 			0x00, //uint8_t base_oem_unit_handle;
@@ -7112,27 +8563,247 @@ pldm_sensor_info plat_pldm_sensor_quick_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			45500, //uint32_t critical_high;
+			297000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
 		.update_time = 0,
 		{
-			.num = SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_CURR_A,
+			.num = SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_PWR_W,
 			.type = sensor_dev_mp2971,
 			.port = I2C_BUS3,
-			.target_addr = ASIC_P0V85_HAMSA_VDD_ADDR,
-			.offset = PMBUS_READ_IOUT,
+			.target_addr = ASIC_P1V1_VDDQC_HBM0246_ADDR,
+			.offset = PMBUS_READ_POUT,
 			.access_checker = is_vr_access,
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
 			.pre_sensor_read_hook = pre_vr_read,
-			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_8 * 2 + 1],
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_9 * 2],
 			.post_sensor_read_hook = post_vr_read,
-			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_8 * 2 + 1],
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_9 * 2],
 		},
+		.poll_interval_ms = 1000, //1000ms
+	},
+	{
+		{
+			// ASIC_P1V1_VDDQC_HBM1357_PWR_W
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_PWR_W, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_PWR_W, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x07, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			297000, //uint32_t critical_high;
+			0, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_PWR_W,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS2,
+			.target_addr = ASIC_P1V1_VDDQC_HBM1357_ADDR,
+			.offset = PMBUS_READ_POUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_6 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_6 * 2],
+		},
+		.poll_interval_ms = 1000, //1000ms
+	},
+	{
+		{
+			// ASIC_P0V75_OWL_E_VDD_PWR_W
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_PWR_W, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_PWR_W, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x07, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			112500, //uint32_t critical_high;
+			0, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_PWR_W,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS2,
+			.target_addr = ASIC_P0V75_OWL_E_VDD_ADDR,
+			.offset = PMBUS_READ_POUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_5 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_5 * 2],
+		},
+		.poll_interval_ms = 1000, //1000ms
+	},
+	{
+		{
+			// ASIC_P0V75_OWL_W_VDD_PWR_W
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_PWR_W, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_PWR_W, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x07, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			112500, //uint32_t critical_high;
+			0, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_PWR_W,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS3,
+			.target_addr = ASIC_P0V75_OWL_W_VDD_ADDR,
+			.offset = PMBUS_READ_POUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_11 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_11 * 2],
+		},
+		.poll_interval_ms = 1000, //1000ms
 	},
 	{
 		{
@@ -7184,7 +8855,7 @@ pldm_sensor_info plat_pldm_sensor_quick_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			42020, //uint32_t critical_high;
+			63750, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -7205,6 +8876,7 @@ pldm_sensor_info plat_pldm_sensor_quick_vr_table[] = {
 			.post_sensor_read_hook = post_vr_read,
 			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_8 * 2 + 1],
 		},
+		.poll_interval_ms = 1000, //1000ms
 	},
 };
 
@@ -7275,6 +8947,7 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_common_sensor_read,
 		},
 	},
 	{
@@ -7327,8 +9000,8 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			13790, //uint32_t critical_high;
-			11750, //uint32_t critical_low;
+			13770, //uint32_t critical_high;
+			11730, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -7343,6 +9016,7 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_common_sensor_read,
 		},
 	},
 	{
@@ -7395,7 +9069,7 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			74520, //uint32_t critical_high;
+			180000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -7411,6 +9085,7 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_ubc_read,
 		},
 	},
 	{
@@ -7463,7 +9138,7 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			1032760, //uint32_t critical_high;
+			2295000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -7479,6 +9154,7 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_ubc_read,
 		},
 	},
 	{
@@ -7531,8 +9207,8 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			55160, //uint32_t critical_high;
-			47000, //uint32_t critical_low;
+			55557, //uint32_t critical_high;
+			45620, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -7547,6 +9223,7 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_common_sensor_read,
 		},
 	},
 	{
@@ -7615,6 +9292,7 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_common_sensor_read,
 		},
 	},
 	{
@@ -7667,8 +9345,8 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			13790, //uint32_t critical_high;
-			11750, //uint32_t critical_low;
+			13770, //uint32_t critical_high;
+			11730, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -7683,6 +9361,7 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_common_sensor_read,
 		},
 	},
 	{
@@ -7735,7 +9414,7 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			74520, //uint32_t critical_high;
+			180000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -7751,6 +9430,7 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_ubc_read,
 		},
 	},
 	{
@@ -7803,7 +9483,7 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			1032760, //uint32_t critical_high;
+			2295000, //uint32_t critical_high;
 			0, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -7819,6 +9499,7 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_ubc_read,
 		},
 	},
 	{
@@ -7871,8 +9552,8 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			55160, //uint32_t critical_high;
-			47000, //uint32_t critical_low;
+			55557, //uint32_t critical_high;
+			45620, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
 		},
@@ -7887,6 +9568,373 @@ pldm_sensor_info plat_pldm_sensor_ubc_table[] = {
 			.sample_count = SAMPLE_COUNT_DEFAULT,
 			.cache = 0,
 			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.post_sensor_read_hook = post_common_sensor_read,
+		},
+	},
+};
+
+pldm_sensor_info plat_pldm_sensor_evb_table[] = {
+	{
+		{
+			// P3V3_OSFP_TEMP_C
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_P3V3_OSFP_TEMP_C, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_P3V3_OSFP_TEMP_C, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x02, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			110000, //uint32_t critical_high;
+			0, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_P3V3_OSFP_TEMP_C,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS1,
+			.target_addr = P3V3_OSFP_ADDR,
+			.offset = PMBUS_READ_TEMPERATURE_1,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_13 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_13 * 2],
+		},
+	},
+	{
+		{
+			// P3V3_OSFP_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_P3V3_OSFP_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_P3V3_OSFP_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x05, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			3564, //uint32_t critical_high;
+			3036, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_P3V3_OSFP_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS1,
+			.target_addr = P3V3_OSFP_ADDR,
+			.offset = PMBUS_READ_VOUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_13 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_13 * 2],
+			.init_args = &mp2971_init_args[0],
+		},
+	},
+	{
+		{
+			// P3V3_OSFP_CURR_A
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_P3V3_OSFP_CURR_A, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_P3V3_OSFP_CURR_A, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x06, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			70000, //uint32_t critical_high;
+			0, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_P3V3_OSFP_CURR_A,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS1,
+			.target_addr = P3V3_OSFP_ADDR,
+			.offset = PMBUS_READ_IOUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_13 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_13 * 2],
+		},
+	},
+	{
+		{
+			// P3V3_OSFP_PWR_W
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_P3V3_OSFP_PWR_W, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_P3V3_OSFP_PWR_W, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x07, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			231000, //uint32_t critical_high;
+			0, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_P3V3_OSFP_PWR_W,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS1,
+			.target_addr = P3V3_OSFP_ADDR,
+			.offset = PMBUS_READ_POUT,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_13 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_13 * 2],
+			.init_args = &mp2971_init_args[0],
+		},
+	},
+	{
+		{
+			// SENSOR_NUM_P3V3_OSFP_INPUT_VOLT_V
+			/*** PDR common header***/
+			{
+				0x00000000, //uint32_t record_handle
+				0x01, //uint8_t PDR_header_version
+				PLDM_NUMERIC_SENSOR_PDR, //uint8_t PDR_type
+				0x0000, //uint16_t record_change_number
+				0x0000, //uint16_t data_length
+			},
+
+			/***numeric sensor format***/
+			0x0000, //uint16_t PLDM_terminus_handle;
+			SENSOR_NUM_P3V3_OSFP_INPUT_VOLT_V, //uint16_t sensor_id;
+			0x0000, //uint16_t entity_type; //Need to check
+			SENSOR_NUM_P3V3_OSFP_INPUT_VOLT_V, //uint16_t entity_instance_number;
+			0x0000, //uint16_t container_id;
+			0x00, //uint8_t sensor_init; //Need to check
+			0x01, //uint8_t sensor_auxiliary_names_pdr;
+			0x07, //uint8_t base_unit;  //unit
+			-3, //int8_t unit_modifier; //Need to check
+			0x00, //uint8_t rate_unit;
+			0x00, //uint8_t base_oem_unit_handle;
+			0x00, //uint8_t aux_unit;
+			0x00, //int8_t aux_unit_modifier;
+			0x00, //uint8_t auxrate_unit;
+			0x00, //uint8_t rel;
+			0x00, //uint8_t aux_oem_unit_handle;
+			0x00, //uint8_t is_linear;
+			0x4, //uint8_t sensor_data_size;
+			1, //real32_t resolution;
+			0, //real32_t offset;
+			0x0000, //uint16_t accuracy;
+			0x00, //uint8_t plus_tolerance;
+			0x00, //uint8_t minus_tolerance;
+			0x00000000, //uint32_t hysteresis;
+			UP_THRESHOLD_CRIT | LOW_THRESHOLD_CRIT, //uint8_t supported_thresholds;
+			0x00, //uint8_t threshold_and_hysteresis_volatility;
+			0, //real32_t state_transition_interval;
+			UPDATE_INTERVAL_1S, //real32_t update_interval;
+			0x00000000, //uint32_t max_readable; //Need to check
+			0x00000000, //uint32_t min_readable;
+			0x04, //uint8_t range_field_format;
+			0x00, //uint8_t range_field_support; //Need to check
+			0x00000000, //uint32_t nominal_value;
+			0x00000000, //uint32_t normal_max;
+			0x00000000, //uint32_t normal_min;
+			0, //uint32_t warning_high;
+			0, //uint32_t warning_low;
+			16000, //uint32_t critical_high;
+			7000, //uint32_t critical_low;
+			0, //uint32_t fatal_high;
+			0, //uint32_t fatal_low;
+		},
+		.update_time = 0,
+		{
+			.num = SENSOR_NUM_P3V3_OSFP_INPUT_VOLT_V,
+			.type = sensor_dev_mp2971,
+			.port = I2C_BUS1,
+			.target_addr = P3V3_OSFP_ADDR,
+			.offset = PMBUS_READ_VIN,
+			.access_checker = is_vr_access,
+			.sample_count = SAMPLE_COUNT_DEFAULT,
+			.cache = 0,
+			.cache_status = PLDM_SENSOR_INITIALIZING,
+			.pre_sensor_read_hook = pre_vr_read,
+			.pre_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_13 * 2],
+			.post_sensor_read_hook = post_vr_read,
+			.post_sensor_read_args = &vr_pre_read_args[VR_INDEX_E_13 * 2],
+			.init_args = &mp2971_init_args[0],
 		},
 	},
 };
@@ -7905,7 +9953,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_TOP_INLET_TEMP_C",
+		.sensorName = u"TOP_INLET_TEMP_C",
 	},
 	{
 		{
@@ -7920,7 +9968,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_BOT_INLET_TEMP_C",
+		.sensorName = u"BOT_INLET_TEMP_C",
 	},
 	{
 		{
@@ -7935,7 +9983,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_BOT_OUTLET_TEMP_C",
+		.sensorName = u"BOT_OUTLET_TEMP_C",
 	},
 	{
 		{
@@ -7950,7 +9998,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_MEDHA0_SENSOR0_TEMP_C",
+		.sensorName = u"ASIC_MEDHA0_SENSOR0_TEMP_C",
 	},
 	{
 		{
@@ -7965,7 +10013,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_MEDHA0_SENSOR1_TEMP_C",
+		.sensorName = u"ASIC_MEDHA0_SENSOR1_TEMP_C",
 	},
 	{
 		{
@@ -7980,7 +10028,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_OWL_W_TEMP_C",
+		.sensorName = u"ASIC_OWL_W_TEMP_C",
 	},
 	{
 		{
@@ -7995,7 +10043,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_OWL_E_TEMP_C",
+		.sensorName = u"ASIC_OWL_E_TEMP_C",
 	},
 	{
 		{
@@ -8010,7 +10058,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_MEDHA1_SENSOR0_TEMP_C",
+		.sensorName = u"ASIC_MEDHA1_SENSOR0_TEMP_C",
 	},
 	{
 		{
@@ -8025,7 +10073,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_MEDHA1_SENSOR1_TEMP_C",
+		.sensorName = u"ASIC_MEDHA1_SENSOR1_TEMP_C",
 	},
 	{
 		{
@@ -8040,7 +10088,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_HAMSA_CRM_TEMP_C",
+		.sensorName = u"ASIC_HAMSA_CRM_TEMP_C",
 	},
 	{
 		{
@@ -8055,7 +10103,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_HAMSA_LS_TEMP_C",
+		.sensorName = u"ASIC_HAMSA_LS_TEMP_C",
 	},
 	{
 		{
@@ -8070,7 +10118,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_TEMP_C",
+		.sensorName = u"ASIC_P0V85_MEDHA0_VDD_TEMP_C",
 	},
 	{
 		{
@@ -8085,7 +10133,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_VOLT_V",
+		.sensorName = u"ASIC_P0V85_MEDHA0_VDD_VOLT_V",
 	},
 	{
 		{
@@ -8100,7 +10148,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_CURR_A",
+		.sensorName = u"ASIC_P0V85_MEDHA0_VDD_CURR_A",
 	},
 	{
 		{
@@ -8115,7 +10163,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_PWR_W",
+		.sensorName = u"ASIC_P0V85_MEDHA0_VDD_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V85_MEDHA0_VDD_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -8130,7 +10193,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_TEMP_C",
+		.sensorName = u"ASIC_P0V85_MEDHA1_VDD_TEMP_C",
 	},
 	{
 		{
@@ -8145,7 +10208,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_VOLT_V",
+		.sensorName = u"ASIC_P0V85_MEDHA1_VDD_VOLT_V",
 	},
 	{
 		{
@@ -8160,7 +10223,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_CURR_A",
+		.sensorName = u"ASIC_P0V85_MEDHA1_VDD_CURR_A",
 	},
 	{
 		{
@@ -8175,7 +10238,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_PWR_W",
+		.sensorName = u"ASIC_P0V85_MEDHA1_VDD_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V85_MEDHA1_VDD_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -8190,7 +10268,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V9_OWL_E_TRVDD_TEMP_C",
+		.sensorName = u"ASIC_P0V9_OWL_E_TRVDD_TEMP_C",
 	},
 	{
 		{
@@ -8205,7 +10283,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V9_OWL_E_TRVDD_VOLT_V",
+		.sensorName = u"ASIC_P0V9_OWL_E_TRVDD_VOLT_V",
 	},
 	{
 		{
@@ -8220,7 +10298,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V9_OWL_E_TRVDD_CURR_A",
+		.sensorName = u"ASIC_P0V9_OWL_E_TRVDD_CURR_A",
 	},
 	{
 		{
@@ -8235,7 +10313,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V9_OWL_E_TRVDD_PWR_W",
+		.sensorName = u"ASIC_P0V9_OWL_E_TRVDD_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V9_OWL_E_TRVDD_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V9_OWL_E_TRVDD_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -8250,7 +10343,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_E_TRVDD_TEMP_C",
+		.sensorName = u"ASIC_P0V75_OWL_E_TRVDD_TEMP_C",
 	},
 	{
 		{
@@ -8265,7 +10358,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_E_TRVDD_VOLT_V",
+		.sensorName = u"ASIC_P0V75_OWL_E_TRVDD_VOLT_V",
 	},
 	{
 		{
@@ -8280,7 +10373,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_E_TRVDD_CURR_A",
+		.sensorName = u"ASIC_P0V75_OWL_E_TRVDD_CURR_A",
 	},
 	{
 		{
@@ -8295,7 +10388,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_E_TRVDD_PWR_W",
+		.sensorName = u"ASIC_P0V75_OWL_E_TRVDD_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V75_OWL_E_TRVDD_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V75_OWL_E_TRVDD_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -8310,7 +10418,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_TEMP_C",
+		.sensorName = u"ASIC_P0V75_OWL_E_VDD_TEMP_C",
 	},
 	{
 		{
@@ -8325,7 +10433,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_VOLT_V",
+		.sensorName = u"ASIC_P0V75_OWL_E_VDD_VOLT_V",
 	},
 	{
 		{
@@ -8340,7 +10448,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_CURR_A",
+		.sensorName = u"ASIC_P0V75_OWL_E_VDD_CURR_A",
 	},
 	{
 		{
@@ -8355,7 +10463,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_PWR_W",
+		.sensorName = u"ASIC_P0V75_OWL_E_VDD_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V75_OWL_E_VDD_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -8370,7 +10493,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V9_OWL_W_TRVDD_TEMP_C",
+		.sensorName = u"ASIC_P0V9_OWL_W_TRVDD_TEMP_C",
 	},
 	{
 		{
@@ -8385,7 +10508,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V9_OWL_W_TRVDD_VOLT_V",
+		.sensorName = u"ASIC_P0V9_OWL_W_TRVDD_VOLT_V",
 	},
 	{
 		{
@@ -8400,7 +10523,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V9_OWL_W_TRVDD_CURR_A",
+		.sensorName = u"ASIC_P0V9_OWL_W_TRVDD_CURR_A",
 	},
 	{
 		{
@@ -8415,7 +10538,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V9_OWL_W_TRVDD_PWR_W",
+		.sensorName = u"ASIC_P0V9_OWL_W_TRVDD_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V9_OWL_W_TRVDD_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V9_OWL_W_TRVDD_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -8430,7 +10568,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_W_TRVDD_TEMP_C",
+		.sensorName = u"ASIC_P0V75_OWL_W_TRVDD_TEMP_C",
 	},
 	{
 		{
@@ -8445,7 +10583,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_W_TRVDD_VOLT_V",
+		.sensorName = u"ASIC_P0V75_OWL_W_TRVDD_VOLT_V",
 	},
 	{
 		{
@@ -8460,7 +10598,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_W_TRVDD_CURR_A",
+		.sensorName = u"ASIC_P0V75_OWL_W_TRVDD_CURR_A",
 	},
 	{
 		{
@@ -8475,7 +10613,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_W_TRVDD_PWR_W",
+		.sensorName = u"ASIC_P0V75_OWL_W_TRVDD_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V75_OWL_W_TRVDD_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V75_OWL_W_TRVDD_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -8490,7 +10643,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_TEMP_C",
+		.sensorName = u"ASIC_P0V75_OWL_W_VDD_TEMP_C",
 	},
 	{
 		{
@@ -8505,7 +10658,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_VOLT_V",
+		.sensorName = u"ASIC_P0V75_OWL_W_VDD_VOLT_V",
 	},
 	{
 		{
@@ -8520,7 +10673,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_CURR_A",
+		.sensorName = u"ASIC_P0V75_OWL_W_VDD_CURR_A",
 	},
 	{
 		{
@@ -8535,7 +10688,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_PWR_W",
+		.sensorName = u"ASIC_P0V75_OWL_W_VDD_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V75_OWL_W_VDD_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -8550,7 +10718,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_MAX_M_VDD_TEMP_C",
+		.sensorName = u"ASIC_P0V75_MAX_M_VDD_TEMP_C",
 	},
 	{
 		{
@@ -8565,7 +10733,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_MAX_M_VDD_VOLT_V",
+		.sensorName = u"ASIC_P0V75_MAX_M_VDD_VOLT_V",
 	},
 	{
 		{
@@ -8580,7 +10748,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_MAX_M_VDD_CURR_A",
+		.sensorName = u"ASIC_P0V75_MAX_M_VDD_CURR_A",
 	},
 	{
 		{
@@ -8595,7 +10763,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_MAX_M_VDD_PWR_W",
+		.sensorName = u"ASIC_P0V75_MAX_M_VDD_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V75_MAX_M_VDD_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V75_MAX_M_VDD_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -8610,7 +10793,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_MAX_N_VDD_TEMP_C",
+		.sensorName = u"ASIC_P0V75_MAX_N_VDD_TEMP_C",
 	},
 	{
 		{
@@ -8625,7 +10808,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_MAX_N_VDD_VOLT_V",
+		.sensorName = u"ASIC_P0V75_MAX_N_VDD_VOLT_V",
 	},
 	{
 		{
@@ -8640,7 +10823,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_MAX_N_VDD_CURR_A",
+		.sensorName = u"ASIC_P0V75_MAX_N_VDD_CURR_A",
 	},
 	{
 		{
@@ -8655,7 +10838,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_MAX_N_VDD_PWR_W",
+		.sensorName = u"ASIC_P0V75_MAX_N_VDD_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V75_MAX_N_VDD_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V75_MAX_N_VDD_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -8670,7 +10868,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_MAX_S_VDD_TEMP_C",
+		.sensorName = u"ASIC_P0V75_MAX_S_VDD_TEMP_C",
 	},
 	{
 		{
@@ -8685,7 +10883,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_MAX_S_VDD_VOLT_V",
+		.sensorName = u"ASIC_P0V75_MAX_S_VDD_VOLT_V",
 	},
 	{
 		{
@@ -8700,7 +10898,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_MAX_S_VDD_CURR_A",
+		.sensorName = u"ASIC_P0V75_MAX_S_VDD_CURR_A",
 	},
 	{
 		{
@@ -8715,7 +10913,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_MAX_S_VDD_PWR_W",
+		.sensorName = u"ASIC_P0V75_MAX_S_VDD_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V75_MAX_S_VDD_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V75_MAX_S_VDD_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -8730,7 +10943,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V8_HAMSA_AVDD_PCIE_TEMP_C",
+		.sensorName = u"ASIC_P0V8_HAMSA_AVDD_PCIE_TEMP_C",
 	},
 	{
 		{
@@ -8745,7 +10958,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V8_HAMSA_AVDD_PCIE_VOLT_V",
+		.sensorName = u"ASIC_P0V8_HAMSA_AVDD_PCIE_VOLT_V",
 	},
 	{
 		{
@@ -8760,7 +10973,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V8_HAMSA_AVDD_PCIE_CURR_A",
+		.sensorName = u"ASIC_P0V8_HAMSA_AVDD_PCIE_CURR_A",
 	},
 	{
 		{
@@ -8775,7 +10988,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V8_HAMSA_AVDD_PCIE_PWR_W",
+		.sensorName = u"ASIC_P0V8_HAMSA_AVDD_PCIE_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V8_HAMSA_AVDD_PCIE_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V8_HAMSA_AVDD_PCIE_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -8790,7 +11018,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_TEMP_C",
+		.sensorName = u"ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_TEMP_C",
 	},
 	{
 		{
@@ -8805,7 +11033,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_VOLT_V",
+		.sensorName = u"ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_VOLT_V",
 	},
 	{
 		{
@@ -8820,7 +11048,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_CURR_A",
+		.sensorName = u"ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_CURR_A",
 	},
 	{
 		{
@@ -8835,7 +11063,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_PWR_W",
+		.sensorName = u"ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P1V2_HAMSA_VDDHRXTX_PCIE_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -8850,7 +11093,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_TEMP_C",
+		.sensorName = u"ASIC_P0V85_HAMSA_VDD_TEMP_C",
 	},
 	{
 		{
@@ -8865,7 +11108,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_VOLT_V",
+		.sensorName = u"ASIC_P0V85_HAMSA_VDD_VOLT_V",
 	},
 	{
 		{
@@ -8880,7 +11123,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_CURR_A",
+		.sensorName = u"ASIC_P0V85_HAMSA_VDD_CURR_A",
 	},
 	{
 		{
@@ -8895,7 +11138,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_PWR_W",
+		.sensorName = u"ASIC_P0V85_HAMSA_VDD_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V85_HAMSA_VDD_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -8910,7 +11168,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM0246_TEMP_C",
+		.sensorName = u"ASIC_P0V75_VDDPHY_HBM0246_TEMP_C",
 	},
 	{
 		{
@@ -8925,7 +11183,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM0246_VOLT_V",
+		.sensorName = u"ASIC_P0V75_VDDPHY_HBM0246_VOLT_V",
 	},
 	{
 		{
@@ -8940,7 +11198,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM0246_CURR_A",
+		.sensorName = u"ASIC_P0V75_VDDPHY_HBM0246_CURR_A",
 	},
 	{
 		{
@@ -8955,7 +11213,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM0246_PWR_W",
+		.sensorName = u"ASIC_P0V75_VDDPHY_HBM0246_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM0246_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V75_VDDPHY_HBM0246_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -8970,7 +11243,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V4_VDDQL_HBM0246_TEMP_C",
+		.sensorName = u"ASIC_P0V4_VDDQL_HBM0246_TEMP_C",
 	},
 	{
 		{
@@ -8985,7 +11258,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V4_VDDQL_HBM0246_VOLT_V",
+		.sensorName = u"ASIC_P0V4_VDDQL_HBM0246_VOLT_V",
 	},
 	{
 		{
@@ -9000,7 +11273,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V4_VDDQL_HBM0246_CURR_A",
+		.sensorName = u"ASIC_P0V4_VDDQL_HBM0246_CURR_A",
 	},
 	{
 		{
@@ -9015,7 +11288,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V4_VDDQL_HBM0246_PWR_W",
+		.sensorName = u"ASIC_P0V4_VDDQL_HBM0246_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V4_VDDQL_HBM0246_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V4_VDDQL_HBM0246_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -9030,7 +11318,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_TEMP_C",
+		.sensorName = u"ASIC_P1V1_VDDQC_HBM0246_TEMP_C",
 	},
 	{
 		{
@@ -9045,7 +11333,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_VOLT_V",
+		.sensorName = u"ASIC_P1V1_VDDQC_HBM0246_VOLT_V",
 	},
 	{
 		{
@@ -9060,7 +11348,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_CURR_A",
+		.sensorName = u"ASIC_P1V1_VDDQC_HBM0246_CURR_A",
 	},
 	{
 		{
@@ -9075,7 +11363,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_PWR_W",
+		.sensorName = u"ASIC_P1V1_VDDQC_HBM0246_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P1V1_VDDQC_HBM0246_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -9090,7 +11393,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V8_VPP_HBM0246_TEMP_C",
+		.sensorName = u"ASIC_P1V8_VPP_HBM0246_TEMP_C",
 	},
 	{
 		{
@@ -9105,7 +11408,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V8_VPP_HBM0246_VOLT_V",
+		.sensorName = u"ASIC_P1V8_VPP_HBM0246_VOLT_V",
 	},
 	{
 		{
@@ -9120,7 +11423,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V8_VPP_HBM0246_CURR_A",
+		.sensorName = u"ASIC_P1V8_VPP_HBM0246_CURR_A",
 	},
 	{
 		{
@@ -9135,7 +11438,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V8_VPP_HBM0246_PWR_W",
+		.sensorName = u"ASIC_P1V8_VPP_HBM0246_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P1V8_VPP_HBM0246_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P1V8_VPP_HBM0246_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -9150,7 +11468,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM1357_TEMP_C",
+		.sensorName = u"ASIC_P0V75_VDDPHY_HBM1357_TEMP_C",
 	},
 	{
 		{
@@ -9165,7 +11483,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM1357_VOLT_V",
+		.sensorName = u"ASIC_P0V75_VDDPHY_HBM1357_VOLT_V",
 	},
 	{
 		{
@@ -9180,7 +11498,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM1357_CURR_A",
+		.sensorName = u"ASIC_P0V75_VDDPHY_HBM1357_CURR_A",
 	},
 	{
 		{
@@ -9195,7 +11513,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM1357_PWR_W",
+		.sensorName = u"ASIC_P0V75_VDDPHY_HBM1357_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V75_VDDPHY_HBM1357_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V75_VDDPHY_HBM1357_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -9210,7 +11543,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V4_VDDQL_HBM1357_TEMP_C",
+		.sensorName = u"ASIC_P0V4_VDDQL_HBM1357_TEMP_C",
 	},
 	{
 		{
@@ -9225,7 +11558,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V4_VDDQL_HBM1357_VOLT_V",
+		.sensorName = u"ASIC_P0V4_VDDQL_HBM1357_VOLT_V",
 	},
 	{
 		{
@@ -9240,7 +11573,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V4_VDDQL_HBM1357_CURR_A",
+		.sensorName = u"ASIC_P0V4_VDDQL_HBM1357_CURR_A",
 	},
 	{
 		{
@@ -9255,7 +11588,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P0V4_VDDQL_HBM1357_PWR_W",
+		.sensorName = u"ASIC_P0V4_VDDQL_HBM1357_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P0V4_VDDQL_HBM1357_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P0V4_VDDQL_HBM1357_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -9270,7 +11618,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_TEMP_C",
+		.sensorName = u"ASIC_P1V1_VDDQC_HBM1357_TEMP_C",
 	},
 	{
 		{
@@ -9285,7 +11633,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_VOLT_V",
+		.sensorName = u"ASIC_P1V1_VDDQC_HBM1357_VOLT_V",
 	},
 	{
 		{
@@ -9300,7 +11648,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_CURR_A",
+		.sensorName = u"ASIC_P1V1_VDDQC_HBM1357_CURR_A",
 	},
 	{
 		{
@@ -9315,7 +11663,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_PWR_W",
+		.sensorName = u"ASIC_P1V1_VDDQC_HBM1357_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P1V1_VDDQC_HBM1357_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -9330,7 +11693,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V8_VPP_HBM1357_TEMP_C",
+		.sensorName = u"ASIC_P1V8_VPP_HBM1357_TEMP_C",
 	},
 	{
 		{
@@ -9345,7 +11708,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V8_VPP_HBM1357_VOLT_V",
+		.sensorName = u"ASIC_P1V8_VPP_HBM1357_VOLT_V",
 	},
 	{
 		{
@@ -9360,7 +11723,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V8_VPP_HBM1357_CURR_A",
+		.sensorName = u"ASIC_P1V8_VPP_HBM1357_CURR_A",
 	},
 	{
 		{
@@ -9375,7 +11738,22 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_ASIC_P1V8_VPP_HBM1357_PWR_W",
+		.sensorName = u"ASIC_P1V8_VPP_HBM1357_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_ASIC_P1V8_VPP_HBM1357_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"ASIC_P1V8_VPP_HBM1357_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -9390,7 +11768,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_UBC1_P12V_TEMP_C",
+		.sensorName = u"UBC1_P12V_TEMP_C",
 	},
 	{
 		{
@@ -9405,7 +11783,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_UBC1_P12V_VOLT_V",
+		.sensorName = u"UBC1_P12V_VOLT_V",
 	},
 	{
 		{
@@ -9420,7 +11798,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_UBC1_P12V_CURR_A",
+		.sensorName = u"UBC1_P12V_CURR_A",
 	},
 	{
 		{
@@ -9435,7 +11813,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_UBC1_P12V_PWR_W",
+		.sensorName = u"UBC1_P12V_PWR_W",
 	},
 	{
 		{
@@ -9450,7 +11828,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_UBC1_P52V_INPUT_VOLT_V",
+		.sensorName = u"UBC1_P52V_INPUT_VOLT_V",
 	},
 	{
 		{
@@ -9465,7 +11843,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_UBC2_P12V_TEMP_C",
+		.sensorName = u"UBC2_P12V_TEMP_C",
 	},
 	{
 		{
@@ -9480,7 +11858,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_UBC2_P12V_VOLT_V",
+		.sensorName = u"UBC2_P12V_VOLT_V",
 	},
 	{
 		{
@@ -9495,7 +11873,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_UBC2_P12V_CURR_A",
+		.sensorName = u"UBC2_P12V_CURR_A",
 	},
 	{
 		{
@@ -9510,7 +11888,7 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_UBC2_P12V_PWR_W",
+		.sensorName = u"UBC2_P12V_PWR_W",
 	},
 	{
 		{
@@ -9525,7 +11903,85 @@ PDR_sensor_auxiliary_names plat_pdr_sensor_aux_names_table[] = {
 		.sensor_count = 0x1,
 		.nameStringCount = 0x1,
 		.nameLanguageTag = "en",
-		.sensorName = u"SENSOR_NUM_UBC2_P52V_INPUT_VOLT_V",
+		.sensorName = u"UBC2_P52V_INPUT_VOLT_V",
+	},
+};
+
+PDR_sensor_auxiliary_names plat_evb_pdr_sensor_aux_names_table[] = {
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_P3V3_OSFP_TEMP_C,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"P3V3_OSFP_TEMP_C",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_P3V3_OSFP_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"P3V3_OSFP_VOLT_V",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_P3V3_OSFP_CURR_A,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"P3V3_OSFP_CURR_A",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_P3V3_OSFP_PWR_W,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"P3V3_OSFP_PWR_W",
+	},
+	{
+		{
+			.record_handle = 0x00000000,
+			.PDR_header_version = 0x01,
+			.PDR_type = PLDM_SENSOR_AUXILIARY_NAMES_PDR,
+			.record_change_number = 0x0000,
+			.data_length = 0x0000,
+		},
+		.terminus_handle = 0x0000,
+		.sensor_id = SENSOR_NUM_P3V3_OSFP_INPUT_VOLT_V,
+		.sensor_count = 0x1,
+		.nameStringCount = 0x1,
+		.nameLanguageTag = "en",
+		.sensorName = u"P3V3_OSFP_INPUT_VOLT_V",
 	},
 };
 
@@ -9557,6 +12013,8 @@ uint32_t plat_get_pdr_size(uint8_t pdr_type)
 		break;
 	case PLDM_SENSOR_AUXILIARY_NAMES_PDR:
 		total_size = ARRAY_SIZE(plat_pdr_sensor_aux_names_table);
+		if (get_asic_board_id() == ASIC_BOARD_ID_EVB)
+			total_size += ARRAY_SIZE(plat_evb_pdr_sensor_aux_names_table);
 		break;
 	case PLDM_ENTITY_AUXILIARY_NAMES_PDR:
 		total_size = ARRAY_SIZE(plat_pdr_entity_aux_names_table);
@@ -9584,6 +12042,8 @@ pldm_sensor_info *plat_pldm_sensor_load(int thread_id)
 		return plat_pldm_sensor_quick_vr_table;
 	case TEMP_SENSOR_THREAD_ID:
 		return plat_pldm_sensor_temp_table;
+	case EVB_SENSOR_THREAD_ID:
+		return plat_pldm_sensor_evb_table;
 	default:
 		LOG_ERR("Unknow pldm sensor thread id %d", thread_id);
 		return NULL;
@@ -9606,6 +12066,10 @@ int plat_pldm_sensor_get_sensor_count(int thread_id)
 		break;
 	case UBC_SENSOR_THREAD_ID:
 		count = ARRAY_SIZE(plat_pldm_sensor_ubc_table);
+		break;
+	case EVB_SENSOR_THREAD_ID:
+		if (get_asic_board_id() == ASIC_BOARD_ID_EVB)
+			count = ARRAY_SIZE(plat_pldm_sensor_evb_table);
 		break;
 	default:
 		count = -1;
@@ -9640,6 +12104,12 @@ void plat_pldm_sensor_get_pdr_numeric_sensor(int thread_id, int sensor_num,
 		       &plat_pldm_sensor_ubc_table[sensor_num].pdr_numeric_sensor,
 		       sizeof(PDR_numeric_sensor));
 		break;
+	case EVB_SENSOR_THREAD_ID:
+		if (get_asic_board_id() == ASIC_BOARD_ID_EVB)
+			memcpy(numeric_sensor_table,
+			       &plat_pldm_sensor_evb_table[sensor_num].pdr_numeric_sensor,
+			       sizeof(PDR_numeric_sensor));
+		break;
 	default:
 		LOG_ERR("Unknow pldm sensor thread id %d", thread_id);
 		break;
@@ -9665,6 +12135,10 @@ void plat_load_aux_sensor_names_pdr_table(PDR_sensor_auxiliary_names *aux_sensor
 {
 	memcpy(aux_sensor_name_table, &plat_pdr_sensor_aux_names_table,
 	       sizeof(plat_pdr_sensor_aux_names_table));
+	if (get_asic_board_id() == ASIC_BOARD_ID_EVB)
+		memcpy(&aux_sensor_name_table[ARRAY_SIZE(plat_pdr_sensor_aux_names_table)],
+		       plat_evb_pdr_sensor_aux_names_table,
+		       sizeof(plat_evb_pdr_sensor_aux_names_table));
 }
 
 uint16_t plat_pdr_entity_aux_names_table_size = 0;
@@ -9702,13 +12176,13 @@ void plat_init_entity_aux_names_pdr_table()
 	const char16_t base_name[] = u"RB";
 
 	// Get slot ID
-	uint8_t slot_id = get_mmc_slot() + 1;
+	uint8_t slot_id = get_mmc_slot();
 
 	// Calculate the length of the base name
 	size_t base_len = char16_strlen(base_name);
 
 	// Calculate the required length for the final string (base name + null terminator)
-	size_t total_len = base_len + 1; // +1 for the null terminator
+	size_t total_len = base_len + 2; // +1 for the null terminator
 
 	// Ensure the final length does not exceed MAX_AUX_SENSOR_NAME_LEN
 	if (total_len > MAX_AUX_SENSOR_NAME_LEN) {
@@ -9775,21 +12249,19 @@ bool get_raw_data_from_sensor_id(uint8_t sensor_id, uint8_t offset, uint8_t *val
 
 	if ((cfg->pre_sensor_read_hook)) {
 		if ((cfg->pre_sensor_read_hook)(cfg, cfg->pre_sensor_read_args) == false) {
-			LOG_DBG("%d read raw val pre hook fail!", sensor_id);
 			return false;
 		}
 	}
 
 	if (!plat_i2c_read(cfg->port, cfg->target_addr, offset, val, len)) {
-		LOG_DBG("%d read raw value fail!", sensor_id);
 		ret = false;
 		goto err;
 	}
 
 err:
 	if ((cfg->post_sensor_read_hook)) {
-		if ((cfg->post_sensor_read_hook)(cfg, cfg->post_sensor_read_args, 0) == false) {
-			LOG_DBG("%d read raw value post hook fail!", sensor_id);
+		if ((cfg->post_sensor_read_hook)(cfg, cfg->post_sensor_read_args, 0) == false &&
+		    cfg->cache_status != SENSOR_OPEN_CIRCUIT) {
 			return false;
 		}
 	}
@@ -9797,12 +12269,128 @@ err:
 	return ret;
 }
 
-void change_sensor_cfg(uint8_t vr_module)
+PDR_numeric_sensor *get_pdr_numeric_sensor_by_sensor_id(uint8_t sensor_id)
 {
-	if (vr_module == VR_MODULE_MPS)
+	uint8_t type = check_sensor_type(sensor_id);
+	CHECK_ARG_WITH_RETURN(type == MAX_SENSOR_THREAD_ID, NULL);
+
+	pldm_sensor_info *table = plat_pldm_sensor_load(type);
+	CHECK_NULL_ARG_WITH_RETURN(table, NULL);
+
+	int count = plat_pldm_sensor_get_sensor_count(type);
+	CHECK_ARG_WITH_RETURN(count < 0, NULL);
+
+	for (uint8_t i = 0; i < count; i++) {
+		if (table[i].pldm_sensor_cfg.num == sensor_id)
+			return &table[i].pdr_numeric_sensor;
+	}
+
+	return NULL;
+}
+
+#define SENSOR_CFG_NO_CHANGE 0xFF
+static void change_sensor_cfg_from_thread(uint8_t thread, uint8_t type, uint8_t addr,
+					  void *init_args, uint8_t change_flag)
+{
+	pldm_sensor_info *table = plat_pldm_sensor_load(thread);
+	if (table == NULL)
 		return;
 
+	int count = plat_pldm_sensor_get_sensor_count(thread);
+	if (count < 0)
+		return;
+
+	for (uint8_t j = 0; j < count; j++) {
+		if (type != SENSOR_CFG_NO_CHANGE)
+			table[j].pldm_sensor_cfg.type = type;
+		if (addr != SENSOR_CFG_NO_CHANGE)
+			table[j].pldm_sensor_cfg.target_addr = addr;
+		if (init_args != NULL)
+			table[j].pldm_sensor_cfg.init_args = init_args;
+
+		// if change_flag is true, change UBC1 address
+		if (change_flag) {
+			if (table[j].pldm_sensor_cfg.num >= SENSOR_NUM_UBC1_P12V_TEMP_C &&
+			    table[j].pldm_sensor_cfg.num <= SENSOR_NUM_UBC1_P52V_INPUT_VOLT_V) {
+				table[j].pldm_sensor_cfg.target_addr = UBC1_NEW_ADDR;
+				LOG_INF("change UBC1 sensors 0x%x address to 0x%x",
+					table[j].pldm_sensor_cfg.num,
+					table[j].pldm_sensor_cfg.target_addr);
+			}
+		}
+	}
+}
+
+void change_sensor_cfg(uint8_t asic_board_id, uint8_t vr_module, uint8_t ubc_module,
+		       uint8_t board_rev_id)
+{
+	uint8_t ubc1_change_flag = 0;
+	uint8_t vr_change_mode = OLD_MPS;
+	/*
+	When changing the address version, you first need to check the board type (EVB or Rainbow), and then check the board revision ID.
+	FAB2 corresponds to EVT1B
+	FAB3 corresponds to EVT2
+	There are two VR vendors, and their settings are different:
+	RNS
+	MPS
+	For the two UBC chips, both need to be changed on FAB2.
+	*/
+
+	LOG_INF("asic_board_id: %d, board_rev_id: %d, vr_module: %d", asic_board_id, board_rev_id,
+		vr_module);
+	// VR check version
+	switch (asic_board_id) {
+	case ASIC_BOARD_ID_EVB:
+		// check newer than FAB3
+		if (board_rev_id >= REV_ID_EVT2) {
+			// new RNS
+			if (vr_module == VR_MODULE_RNS) {
+				LOG_WRN("change VR address to new RNS");
+				vr_change_mode = NEW_RNS;
+			}
+			// new MPS
+			if (vr_module == VR_MODULE_MPS) {
+				LOG_WRN("change VR address to new MPS");
+				vr_change_mode = NEW_MPS;
+			}
+		} else {
+			if (vr_module == VR_MODULE_RNS) {
+				LOG_WRN("change VR address to old RNS");
+				vr_change_mode = OLD_RNS;
+			}
+			// default is old MPS so do nothing
+		}
+		break;
+	case ASIC_BOARD_ID_RAINBOW:
+		// check newer than FAB2 (EVT2)
+		if (board_rev_id >= REV_ID_EVT2) {
+			// new RNS
+			if (vr_module == VR_MODULE_RNS) {
+				LOG_WRN("change VR address to new RNS");
+				vr_change_mode = NEW_RNS;
+			}
+			// new MPS
+			if (vr_module == VR_MODULE_MPS) {
+				LOG_WRN("change VR address to new MPS");
+				vr_change_mode = NEW_MPS;
+			}
+		} else {
+			if (vr_module == VR_MODULE_RNS) {
+				LOG_WRN("change VR address to old RNS");
+				vr_change_mode = OLD_RNS;
+			}
+			// default is old MPS so do nothing
+		}
+		break;
+	default:
+		break;
+	}
+	LOG_INF("vr change mode: 0x%x", vr_change_mode);
+	// vr sensor
 	for (uint8_t i = VR_SENSOR_THREAD_ID; i <= QUICK_VR_SENSOR_THREAD_ID; i++) {
+		if (vr_change_mode == OLD_MPS)
+			continue;
+
 		pldm_sensor_info *table = plat_pldm_sensor_load(i);
 		if (table == NULL)
 			return;
@@ -9810,13 +12398,37 @@ void change_sensor_cfg(uint8_t vr_module)
 		int count = plat_pldm_sensor_get_sensor_count(i);
 		if (count < 0)
 			return;
-
+		// change VR address
 		for (uint8_t j = 0; j < count; j++) {
-			table[j].pldm_sensor_cfg.type = sensor_dev_raa228249;
-			table[j].pldm_sensor_cfg.target_addr =
-				convert_addr_to_rns(table[j].pldm_sensor_cfg.target_addr);
+			if (vr_change_mode == NEW_RNS || vr_change_mode == OLD_RNS)
+				table[j].pldm_sensor_cfg.type = sensor_dev_raa228249;
+
+			table[j].pldm_sensor_cfg.target_addr = convert_vr_addr(
+				table[j].pldm_sensor_cfg.target_addr, vr_change_mode);
+			LOG_INF("change VR sensors 0x%x address to 0x%x",
+				table[j].pldm_sensor_cfg.num, table[j].pldm_sensor_cfg.target_addr);
 		}
 	}
+
+	// UBC check newer than FAB2
+	if (board_rev_id >= REV_ID_EVT1B) {
+		// PU82 0x14 -> 0x17
+		ubc1_change_flag = 1;
+	}
+	// ubc sensor, default: UBC_MODULE_DELTA
+	if (ubc_module == UBC_MODULE_MPS)
+		change_sensor_cfg_from_thread(UBC_SENSOR_THREAD_ID, sensor_dev_mpc12109,
+					      SENSOR_CFG_NO_CHANGE, &mpc12109_init_args[0],
+					      ubc1_change_flag);
+	else if (ubc_module == UBC_MODULE_FLEX)
+		change_sensor_cfg_from_thread(UBC_SENSOR_THREAD_ID, sensor_dev_bmr316,
+					      SENSOR_CFG_NO_CHANGE, NULL, ubc1_change_flag);
+	else if (ubc_module == UBC_MODULE_LUXSHARE)
+		change_sensor_cfg_from_thread(UBC_SENSOR_THREAD_ID, sensor_dev_lx6301,
+					      SENSOR_CFG_NO_CHANGE, NULL, ubc1_change_flag);
+	else if (ubc_module == UBC_MODULE_DELTA)
+		change_sensor_cfg_from_thread(UBC_SENSOR_THREAD_ID, sensor_dev_u50su4p180pmdafc,
+					      SENSOR_CFG_NO_CHANGE, NULL, ubc1_change_flag);
 }
 
 bool is_dc_access(uint8_t sensor_num)
@@ -9844,6 +12456,11 @@ void set_plat_sensor_vr_polling_enable_flag(bool value)
 	plat_sensor_vr_polling_enable_flag = value;
 }
 
+void set_plat_sensor_one_step_enable_flag(uint8_t value)
+{
+	plat_sensor_one_step_power_enable_flag = value;
+}
+
 bool get_plat_sensor_polling_enable_flag()
 {
 	return plat_sensor_polling_enable_flag;
@@ -9864,20 +12481,402 @@ bool get_plat_sensor_vr_polling_enable_flag()
 	return plat_sensor_vr_polling_enable_flag;
 }
 
+uint8_t get_plat_sensor_one_step_enable_flag()
+{
+	return plat_sensor_one_step_power_enable_flag;
+}
+
 bool is_ubc_access(uint8_t sensor_num)
 {
-	return (is_dc_access(sensor_num) && get_plat_sensor_ubc_polling_enable_flag() &&
-		get_plat_sensor_polling_enable_flag());
+	if (get_plat_sensor_one_step_enable_flag() == ONE_STEP_POWER_MAGIC_NUMBER) {
+		return (get_plat_sensor_ubc_polling_enable_flag() &&
+			get_plat_sensor_polling_enable_flag() && is_update_state_idle());
+	} else {
+		return (is_dc_access(sensor_num) && get_plat_sensor_ubc_polling_enable_flag() &&
+			get_plat_sensor_polling_enable_flag() && is_update_state_idle());
+	}
 }
 
 bool is_temp_access(uint8_t cfg_idx)
 {
 	return (get_plat_sensor_temp_polling_enable_flag() &&
-		get_plat_sensor_polling_enable_flag());
+		get_plat_sensor_polling_enable_flag() && is_update_state_idle());
 }
 
 bool is_vr_access(uint8_t sensor_num)
 {
-	return (is_dc_access(sensor_num) && get_plat_sensor_vr_polling_enable_flag() &&
-		get_plat_sensor_polling_enable_flag());
+	if (get_plat_sensor_one_step_enable_flag() == ONE_STEP_POWER_MAGIC_NUMBER) {
+		return (get_plat_sensor_vr_polling_enable_flag() &&
+			get_plat_sensor_polling_enable_flag() && is_update_state_idle());
+
+	} else {
+		return (is_dc_access(sensor_num) && get_plat_sensor_vr_polling_enable_flag() &&
+			get_plat_sensor_polling_enable_flag() && is_update_state_idle());
+	}
+}
+
+power_capping_time_setting pwr_capping_setting_table[] = {
+	{ SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_PWR_W, { 10, 5, 2, 1, 2, 5, 5, 2 } },
+	{ SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_PWR_W, { 10, 5, 2, 1, 2, 5, 5, 2 } },
+	{ SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_VOLT_V, { 10, 5, 2, 1, 2, 5, 5, 2 } },
+	{ SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_VOLT_V, { 10, 5, 2, 1, 2, 5, 5, 2 } },
+
+	{ SENSOR_NUM_ASIC_P1V1_VDDQC_HBM0246_PWR_W,
+	  { VR_DEFAULT_POLLING_INTERVAL_MS, VR_DEFAULT_POLLING_INTERVAL_MS,
+	    VR_DEFAULT_POLLING_INTERVAL_MS, VR_DEFAULT_POLLING_INTERVAL_MS, 10, 10, 5, 10 } },
+
+	{ SENSOR_NUM_ASIC_P1V1_VDDQC_HBM1357_PWR_W,
+	  { VR_DEFAULT_POLLING_INTERVAL_MS, VR_DEFAULT_POLLING_INTERVAL_MS,
+	    VR_DEFAULT_POLLING_INTERVAL_MS, VR_DEFAULT_POLLING_INTERVAL_MS, 10, 10, 5, 10 } },
+
+	{ SENSOR_NUM_ASIC_P0V75_OWL_E_VDD_PWR_W,
+	  { VR_DEFAULT_POLLING_INTERVAL_MS, VR_DEFAULT_POLLING_INTERVAL_MS,
+	    VR_DEFAULT_POLLING_INTERVAL_MS, VR_DEFAULT_POLLING_INTERVAL_MS,
+	    VR_DEFAULT_POLLING_INTERVAL_MS, VR_DEFAULT_POLLING_INTERVAL_MS,
+	    VR_DEFAULT_POLLING_INTERVAL_MS, 100 } },
+
+	{ SENSOR_NUM_ASIC_P0V75_OWL_W_VDD_PWR_W,
+	  { VR_DEFAULT_POLLING_INTERVAL_MS, VR_DEFAULT_POLLING_INTERVAL_MS,
+	    VR_DEFAULT_POLLING_INTERVAL_MS, VR_DEFAULT_POLLING_INTERVAL_MS,
+	    VR_DEFAULT_POLLING_INTERVAL_MS, VR_DEFAULT_POLLING_INTERVAL_MS,
+	    VR_DEFAULT_POLLING_INTERVAL_MS, 100 } },
+
+	{ SENSOR_NUM_ASIC_P0V85_HAMSA_VDD_PWR_W,
+	  { VR_DEFAULT_POLLING_INTERVAL_MS, VR_DEFAULT_POLLING_INTERVAL_MS,
+	    VR_DEFAULT_POLLING_INTERVAL_MS, VR_DEFAULT_POLLING_INTERVAL_MS,
+	    VR_DEFAULT_POLLING_INTERVAL_MS, VR_DEFAULT_POLLING_INTERVAL_MS,
+	    VR_DEFAULT_POLLING_INTERVAL_MS, 100 } },
+};
+
+void plat_pldm_sensor_set_quick_vr_poll_interval(uint8_t type, uint8_t capping_source)
+{
+	/*
+	0 default = MEDHA0/1_VDD power every 10ms
+	1 = MEDHA0/1_VDD power every 5ms
+	2 = MEDHA0/1_VDD power every 2ms
+	3 = MEDHA0/1_VDD power every 1ms
+	4 = MEDHA0/1_VDD power every 2ms, VDDQC0246/VDDQC1357 every 10ms
+	5 = MEDHA0/1_VDD power every 5ms, VDDQC0246/VDDQC1357 every 10ms
+	6 = MEDHA0/1_VDD power every 5ms, VDDQC0246/VDDQC1357 every 5ms
+	7 = MEDHA0/1_VDD power every 2ms, VDDQC0246/VDDQC1357 every 10ms, OWL_E_VDD/OWL_W_VDD/HAMSA_VDD every 100ms
+	*/
+	pldm_sensor_info *table = plat_pldm_sensor_load(QUICK_VR_SENSOR_THREAD_ID);
+	int count = plat_pldm_sensor_get_sensor_count(QUICK_VR_SENSOR_THREAD_ID);
+	// print out polling ms
+	for (uint8_t i = 0; i < count; i++) {
+		LOG_INF("get 0x%x: quick vr poll interval is %d ms", table[i].pldm_sensor_cfg.num,
+			table[i].poll_interval_ms);
+	}
+	if (count < 0) {
+		LOG_ERR("Cannot get table: %d", QUICK_VR_SENSOR_THREAD_ID);
+		return;
+	}
+	// size of pwr_capping_setting_table
+	uint8_t table_size = sizeof(pwr_capping_setting_table) / sizeof(power_capping_time_setting);
+	switch (type) {
+	case 0:
+	case 1:
+	case 2:
+	case 3:
+	case 4:
+	case 5:
+	case 6:
+	case 7:
+		LOG_INF("%d: set medha0/1 poll interval", type);
+		for (uint8_t i = 0; i < count; i++) {
+			for (uint8_t j = 0; j < table_size; j++) {
+				if (table[i].pldm_sensor_cfg.num ==
+				    pwr_capping_setting_table[j].sensor_id) {
+					if (capping_source == CAPPING_SOURCE_VR) {
+						// set vr power polling time
+						if (pwr_capping_setting_table[j].sensor_id ==
+							    SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_VOLT_V ||
+						    pwr_capping_setting_table[j].sensor_id ==
+							    SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_VOLT_V) {
+							table[i].poll_interval_ms =
+								VR_DEFAULT_POLLING_INTERVAL_MS;
+						} else {
+							const uint16_t *time_index =
+								pwr_capping_setting_table[j]
+									.case_time_ms;
+							table[i].poll_interval_ms =
+								time_index[type];
+						}
+
+					} else if (capping_source == CAPPING_SOURCE_ADC) {
+						// set vr voltage polling time
+						if (pwr_capping_setting_table[j].sensor_id ==
+							    SENSOR_NUM_ASIC_P0V85_MEDHA0_VDD_PWR_W ||
+						    pwr_capping_setting_table[j].sensor_id ==
+							    SENSOR_NUM_ASIC_P0V85_MEDHA1_VDD_PWR_W) {
+							table[i].poll_interval_ms =
+								VR_DEFAULT_POLLING_INTERVAL_MS;
+						} else {
+							const uint16_t *time_index =
+								pwr_capping_setting_table[j]
+									.case_time_ms;
+							table[i].poll_interval_ms =
+								time_index[type];
+						}
+					} else {
+						LOG_ERR("set quick vr poll interval error, Wrong source %d",
+							capping_source);
+					}
+				}
+			}
+		}
+		pwr_capping_pollng_rate_type = type;
+		break;
+	default:
+		LOG_ERR("set quick vr poll interval error, Wrong type %d", type);
+		break;
+	};
+	for (uint8_t i = 0; i < count; i++) {
+		LOG_INF("set 0x%x: quick vr poll interval is %d ms", table[i].pldm_sensor_cfg.num,
+			table[i].poll_interval_ms);
+	}
+}
+
+void set_ioe_value(uint8_t ioe_addr, uint8_t ioe_reg, uint8_t value)
+{
+	uint8_t retry = 5;
+	I2C_MSG msg = { 0 };
+	int ret = 0;
+	msg.bus = I2C_BUS1;
+	msg.target_addr = ioe_addr;
+	msg.tx_len = 2;
+	msg.data[0] = ioe_reg;
+	msg.data[1] = value;
+
+	ret = i2c_master_write(&msg, retry);
+
+	if (ret != 0) {
+		LOG_ERR("Failed to write IOE(0x%02X). The register is 0x%02X.", ioe_addr, ioe_reg);
+		k_msleep(3000);
+	}
+}
+int get_ioe_value(uint8_t ioe_addr, uint8_t ioe_reg, uint8_t *value)
+{
+	int ret = 0;
+	uint8_t retry = 5;
+	I2C_MSG msg = { 0 };
+
+	msg.bus = I2C_BUS1;
+	msg.target_addr = ioe_addr;
+	msg.tx_len = 1;
+	msg.rx_len = 1;
+	msg.data[0] = ioe_reg;
+
+	ret = i2c_master_read(&msg, retry);
+
+	if (ret != 0) {
+		LOG_ERR("Failed to read IOE(0x%02X). The register is 0x%02X.", ioe_addr, ioe_reg);
+		k_msleep(3000);
+		return -1;
+	}
+
+	*value = msg.data[0];
+
+	return 0;
+}
+
+uint8_t get_ioe_init_flag()
+{
+	return ioe_init_flag;
+}
+
+void set_ioe_init_flag(uint8_t flag)
+{
+	ioe_init_flag = flag;
+}
+
+struct k_thread quick_sensor_poll;
+K_KERNEL_STACK_MEMBER(quick_sensor_poll_stack, 1024);
+k_tid_t quick_sensor_tid;
+
+void init_U200051_IO()
+{
+	LOG_INF("init U200051 IO expander");
+	// only bit6 is input (1)
+	set_ioe_value(U200051_IO_ADDR, CONFIG, 0x40);
+	// io5,io7 default output 1
+	set_ioe_value(U200051_IO_ADDR, OUTPUT_PORT, 0x80);
+}
+
+/* quick sensor */
+void quick_sensor_poll_handler(void *arug0, void *arug1, void *arug2)
+{
+	k_msleep(1000); // delay 1 second to wait for drivers ready before start sensor polling
+	int quick_sensor_poll_interval_ms = 30;
+	int ret = 0;
+	uint8_t leak_2_value = 0;
+	uint8_t set_io7_value = 0;
+	uint8_t log_show_flag = 0;
+	int count = 0;
+	uint8_t cycle_counter = 0;
+	while (1) {
+		count++;
+		if (is_mb_dc_on() == false || !get_plat_sensor_polling_enable_flag())
+			cycle_counter = 5; //dc off will sleep 1000ms, 5*1000ms = 5s
+		else
+			cycle_counter = 167; // 167*30ms = 5s
+		if (count >= cycle_counter) {
+			count = 0;
+			get_fw_version_boot0_from_asic();
+			uint32_t asic_verion = 0;
+			for (int i = 0; i < BOOT0_MAX; i++) {
+				asic_verion = plat_get_image_version(i);
+				// asic_verion get  bit0~bit23
+				asic_verion = asic_verion & 0xFFFFFF;
+				if (asic_verion != 0 && asic_verion != 0xFFFFFF) {
+					gpio_set(I3C_RAINBOW_ALERT_R_N, 1);
+					break;
+				}
+				gpio_set(I3C_RAINBOW_ALERT_R_N, 0);
+			}
+		}
+		//check dc on/off and polling enable/disable
+		if (is_mb_dc_on() == false || !get_plat_sensor_polling_enable_flag()) {
+			//dc is off, sleep 1 second
+			k_msleep(1000);
+			continue;
+		}
+		// if board id >= EVB EVT1B(FAB2) then do quick sensor polling, else skip
+		if (get_asic_board_id() == ASIC_BOARD_ID_EVB &&
+		    get_board_rev_id() >= REV_ID_EVT1B) {
+			if (!get_ioe_init_flag()) {
+				LOG_INF("U200051 IO expander need init");
+				init_U200051_IO();
+				set_ioe_init_flag(1);
+			}
+
+			k_msleep(quick_sensor_poll_interval_ms);
+			// read mux U200051 IO_6, if change means leak detected set io_7 to 1
+			ret = get_ioe_value(U200051_IO_ADDR, INPUT_PORT, &leak_2_value);
+
+			if (ret != 0) {
+				LOG_ERR("Failed to read IOE(0x%02X). The register is 0x%02X.",
+					U200051_IO_ADDR, OUTPUT_PORT);
+				continue;
+			}
+
+			if (leak_2_value & 0x40) {
+				if (log_show_flag == 0) {
+					LOG_WRN("leak_2 detected");
+					get_ioe_value(U200051_IO_ADDR, OUTPUT_PORT, &set_io7_value);
+					//inverse bit-7
+					set_io7_value ^= 0x80;
+					set_ioe_value(U200051_IO_ADDR, OUTPUT_PORT, set_io7_value);
+					log_show_flag = 1;
+				}
+			} else {
+				log_show_flag = 0;
+			}
+			continue;
+		}
+		k_msleep(quick_sensor_poll_interval_ms);
+	}
+}
+
+void quick_sensor_poll_init()
+{
+	quick_sensor_tid = k_thread_create(&quick_sensor_poll, quick_sensor_poll_stack,
+					   K_THREAD_STACK_SIZEOF(quick_sensor_poll_stack),
+					   quick_sensor_poll_handler, NULL, NULL, NULL,
+					   CONFIG_MAIN_THREAD_PRIORITY, 0, K_NO_WAIT);
+	k_thread_name_set(&quick_sensor_poll, "quick_sensor_poll");
+	return;
+}
+
+uint8_t get_pwr_capping_polling_rate_type()
+{
+	return pwr_capping_pollng_rate_type;
+}
+
+uint16_t get_quick_medha_polling_rate()
+{
+	return pwr_capping_setting_table[0].case_time_ms[pwr_capping_pollng_rate_type];
+}
+
+uint8_t sensor_polling_cmd(void *mctp_inst, uint8_t *buf, uint16_t len, uint8_t instance_id,
+			   uint8_t *resp, uint16_t *resp_len, void *ext_params)
+{
+	CHECK_NULL_ARG_WITH_RETURN(mctp_inst, PLDM_ERROR);
+	CHECK_NULL_ARG_WITH_RETURN(buf, PLDM_ERROR);
+	CHECK_NULL_ARG_WITH_RETURN(resp, PLDM_ERROR);
+	CHECK_NULL_ARG_WITH_RETURN(resp_len, PLDM_ERROR);
+	CHECK_NULL_ARG_WITH_RETURN(ext_params, PLDM_ERROR);
+
+	struct _sensor_polling_cmd_req *req_p = (struct _sensor_polling_cmd_req *)buf;
+	struct _sensor_polling_cmd_resp *resp_p = (struct _sensor_polling_cmd_resp *)resp;
+
+	if (len < (sizeof(*req_p) - 1)) {
+		LOG_WRN("request len %d is invalid", len);
+		resp_p->completion_code = PLDM_ERROR_INVALID_LENGTH;
+		set_iana(resp_p->iana, sizeof(resp_p->iana));
+		goto exit;
+	}
+
+	if (check_iana(req_p->iana) == PLDM_ERROR) {
+		resp_p->completion_code = PLDM_ERROR_INVALID_DATA;
+		set_iana(resp_p->iana, sizeof(resp_p->iana));
+		goto exit;
+	}
+
+	if (!(req_p->set_value == 1 || req_p->set_value == 0)) {
+		LOG_ERR("set sensor_polling:%x is out of range", req_p->set_value);
+		resp_p->completion_code = PLDM_ERROR_INVALID_DATA;
+		set_iana(resp_p->iana, sizeof(resp_p->iana));
+		goto exit;
+	}
+
+	set_plat_sensor_polling_enable_flag(req_p->set_value);
+
+	LOG_INF("set sensor_polling:%x success", req_p->set_value);
+	resp_p->completion_code = PLDM_SUCCESS;
+	set_iana(resp_p->iana, sizeof(resp_p->iana));
+	resp_p->set_value = req_p->set_value;
+
+exit:
+	*resp_len = sizeof(struct _sensor_polling_cmd_resp);
+	return PLDM_SUCCESS;
+}
+
+temp_sensor_change_cfg change_mapping_table[] = {
+	{ SENSOR_NUM_ASIC_MEDHA0_SENSOR0_TEMP_C, ASIC_MEDHA0_SENSOR0_2ND_ADDR,
+	  EMC1413_REMOTE_TEMPERATRUE_1 },
+	{ SENSOR_NUM_ASIC_MEDHA0_SENSOR1_TEMP_C, ASIC_MEDHA0_SENSOR1_2ND_ADDR,
+	  EMC1413_REMOTE_TEMPERATRUE_2 },
+	{ SENSOR_NUM_ASIC_OWL_W_TEMP_C, ASIC_OWL_W_2ND_ADDR, EMC1413_REMOTE_TEMPERATRUE_1 },
+	{ SENSOR_NUM_ASIC_OWL_E_TEMP_C, ASIC_OWL_E_2ND_ADDR, EMC1413_REMOTE_TEMPERATRUE_2 },
+	{ SENSOR_NUM_ASIC_MEDHA1_SENSOR0_TEMP_C, ASIC_MEDHA1_SENSOR0_2ND_ADDR,
+	  EMC1413_REMOTE_TEMPERATRUE_1 },
+	{ SENSOR_NUM_ASIC_MEDHA1_SENSOR1_TEMP_C, ASIC_MEDHA1_SENSOR1_2ND_ADDR,
+	  EMC1413_REMOTE_TEMPERATRUE_2 },
+	{ SENSOR_NUM_ASIC_HAMSA_CRM_TEMP_C, ASIC_HAMSA_CRM_2ND_ADDR, EMC1413_REMOTE_TEMPERATRUE_1 },
+	{ SENSOR_NUM_ASIC_HAMSA_LS_TEMP_C, ASIC_HAMSA_LS_2ND_ADDR, EMC1413_REMOTE_TEMPERATRUE_2 },
+};
+void check_temp_sensor(uint8_t tmp_module)
+{
+	if (tmp_module == TMP_EMC1413) {
+		//change temp sensor type and address to em1413
+		uint8_t table_size = sizeof(plat_pldm_sensor_temp_table) /
+				     sizeof(plat_pldm_sensor_temp_table[0]);
+		for (int i = 0; i < table_size; i++) {
+			for (int j = 0;
+			     j < sizeof(change_mapping_table) / sizeof(temp_sensor_change_cfg);
+			     j++) {
+				if (plat_pldm_sensor_temp_table[i].pldm_sensor_cfg.num ==
+				    change_mapping_table[j].sensor_id) {
+					plat_pldm_sensor_temp_table[i].pldm_sensor_cfg.type =
+						sensor_dev_emc1413;
+					plat_pldm_sensor_temp_table[i].pldm_sensor_cfg.target_addr =
+						change_mapping_table[j].address;
+					plat_pldm_sensor_temp_table[i].pldm_sensor_cfg.offset =
+						change_mapping_table[j].offset;
+					break;
+				}
+			}
+		}
+	}
 }

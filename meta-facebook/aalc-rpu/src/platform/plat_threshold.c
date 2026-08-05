@@ -387,6 +387,19 @@ void fan_board_tach_status_handler(uint8_t sensor_num, uint8_t status)
 	}
 }
 
+static bool is_fan_not_access[14];
+;
+
+void set_is_fan_not_access(uint8_t index, bool flag)
+{
+	is_fan_not_access[index] = flag;
+}
+
+bool get_is_fan_not_access(uint8_t index)
+{
+	return is_fan_not_access[index];
+}
+
 void hex_fan_failure_do(uint32_t sensor_num, uint32_t status)
 {
 	fan_board_tach_status_handler(sensor_num, status);
@@ -397,6 +410,15 @@ void hex_fan_failure_do(uint32_t sensor_num, uint32_t status)
 
 	if (status == THRESHOLD_STATUS_LCR)
 		error_log_event(sensor_num, IS_ABNORMAL_VAL);
+
+	uint8_t fan_not_access_idx = sensor_num - SENSOR_NUM_FB_1_FAN_TACH_RPM;
+	if (status == THRESHOLD_STATUS_NOT_ACCESS) {
+		if (!get_is_fan_not_access(fan_not_access_idx)) {
+			error_log_event(sensor_num, IS_ABNORMAL_VAL);
+			set_is_fan_not_access(fan_not_access_idx, true);
+		}
+	} else
+		set_is_fan_not_access(fan_not_access_idx, false);
 }
 
 /* flow_rate_ready_flag is flag to wait flow rate ready*/
@@ -563,49 +585,24 @@ void abnormal_temp_do(uint32_t sensor_num, uint32_t status)
 	}
 }
 
-static bool is_rack_level_abnormal = false;
-
-void set_is_rack_level_abnormal(bool flag)
-{
-	is_rack_level_abnormal = flag;
-}
-
-bool get_is_rack_level_abnormal()
-{
-	return is_rack_level_abnormal;
-}
-
 void level_sensor_do(uint32_t unused, uint32_t status)
 {
 	if (get_threshold_status(SENSOR_NUM_BPB_RACK_LEVEL_2)) {
-		set_status_flag(STATUS_FLAG_FAILURE, PUMP_FAIL_LOW_LEVEL, 1);
-		if (!get_is_rack_level_abnormal()) {
-			set_is_rack_level_abnormal(true);
-			error_log_event(SENSOR_NUM_BPB_RACK_LEVEL_2, IS_ABNORMAL_VAL);
-		}
+		set_sticky_sensor_status(STICKY_HEX_BLADDER_ABNORMAL, 1);
+		low_level_failure_enable(1);
+		error_log_event(SENSOR_NUM_BPB_RACK_LEVEL_2, IS_ABNORMAL_VAL);
 		if (get_threshold_status(SENSOR_NUM_BPB_RACK_LEVEL_1))
 			led_ctrl(LED_IDX_E_COOLANT, LED_TURN_OFF);
 		else
 			LOG_DBG("BPB_RACK_LEVEL_1 fail\n");
 	} else {
+		low_level_failure_enable(0);
 		if (get_threshold_status(SENSOR_NUM_BPB_RACK_LEVEL_1)) {
 			led_ctrl(LED_IDX_E_COOLANT, LED_START_BLINK);
 		} else {
 			led_ctrl(LED_IDX_E_COOLANT, LED_TURN_ON);
 		}
 	}
-}
-
-static bool is_rpu_level_abnormal = false;
-
-void set_is_rpu_level_abnormal(bool flag)
-{
-	is_rpu_level_abnormal = flag;
-}
-
-bool get_is_rpu_level_abnormal()
-{
-	return is_rpu_level_abnormal;
 }
 
 void rpu_level_sensor_do(uint32_t unused, uint32_t status)
@@ -615,11 +612,9 @@ void rpu_level_sensor_do(uint32_t unused, uint32_t status)
 		return;
 
 	if (get_threshold_status(SENSOR_NUM_BPB_RPU_LEVEL)) {
+		set_sticky_sensor_status(STICKY_RPU_RESERVOIR_ABNORMAL, 1);
 		set_status_flag(STATUS_FLAG_FAILURE, PUMP_FAIL_LOW_RPU_LEVEL, 1);
-		if (!get_is_rpu_level_abnormal()) {
-			set_is_rpu_level_abnormal(true);
-			error_log_event(SENSOR_NUM_BPB_RACK_LEVEL_2, IS_ABNORMAL_VAL);
-		}
+		error_log_event(SENSOR_NUM_BPB_RACK_LEVEL_2, IS_ABNORMAL_VAL);
 	}
 }
 
@@ -764,18 +759,6 @@ sensor_threshold *find_threshold_tbl_entry(uint8_t sensor_num)
 	return NULL;
 }
 
-static bool is_press_abnormal = false;
-
-void set_is_press_abnormal(bool flag)
-{
-	is_press_abnormal = flag;
-}
-
-bool get_is_press_abnormal()
-{
-	return is_press_abnormal;
-}
-
 void abnormal_press_do(uint32_t thres_tbl_idx, uint32_t status)
 {
 	if (thres_tbl_idx >= ARRAY_SIZE(threshold_tbl))
@@ -787,12 +770,9 @@ void abnormal_press_do(uint32_t thres_tbl_idx, uint32_t status)
 		get_sensor_reading_to_real_val(SENSOR_NUM_BPB_RPU_COOLANT_FLOW_RATE_LPM,
 					       &flow_rate_val);
 		if (flow_rate_val < 10.0) {
+			set_sticky_sensor_status(STICKY_RPU_OUTLET_PRESSURE_HIGH, 1);
 			set_status_flag(STATUS_FLAG_FAILURE, PUMP_FAIL_ABNORMAL_PRESS, 1);
-			if (!get_is_press_abnormal()) {
-				set_is_press_abnormal(true);
-				error_log_event(SENSOR_NUM_BPB_RPU_COOLANT_OUTLET_P_KPA,
-						IS_ABNORMAL_VAL);
-			}
+			error_log_event(SENSOR_NUM_BPB_RPU_COOLANT_OUTLET_P_KPA, IS_ABNORMAL_VAL);
 		} else
 			thres_p->last_status = THRESHOLD_STATUS_NORMAL;
 	}
@@ -829,6 +809,38 @@ bool get_is_pump_not_access(uint8_t index)
 	return is_pump_not_access[index];
 }
 
+static uint8_t get_sticky_index(uint8_t sensor_num, uint8_t type)
+{
+	uint8_t idx = 0xFF;
+
+	switch (sensor_num) {
+	case SENSOR_NUM_PB_1_PUMP_TACH_RPM:
+		idx = (type == THRESHOLD_STATUS_LCR)	    ? STICKY_PUMP_1_SPEED_ABNORMAL :
+		      (type == THRESHOLD_STATUS_NOT_ACCESS) ? STICKY_PUMP_1_SPEED_NOT_ACCESS :
+		      (type == THRESHOLD_STATUS_UCR)	    ? STICKY_PUMP_1_SPEED_UCR :
+							      0xFF;
+		break;
+	case SENSOR_NUM_PB_2_PUMP_TACH_RPM:
+		idx = (type == THRESHOLD_STATUS_LCR)	    ? STICKY_PUMP_2_SPEED_ABNORMAL :
+		      (type == THRESHOLD_STATUS_NOT_ACCESS) ? STICKY_PUMP_2_SPEED_NOT_ACCESS :
+		      (type == THRESHOLD_STATUS_UCR)	    ? STICKY_PUMP_2_SPEED_UCR :
+							      0xFF;
+		break;
+
+	case SENSOR_NUM_PB_3_PUMP_TACH_RPM:
+		idx = (type == THRESHOLD_STATUS_LCR)	    ? STICKY_PUMP_3_SPEED_ABNORMAL :
+		      (type == THRESHOLD_STATUS_NOT_ACCESS) ? STICKY_PUMP_3_SPEED_NOT_ACCESS :
+		      (type == THRESHOLD_STATUS_UCR)	    ? STICKY_PUMP_3_SPEED_UCR :
+							      0xFF;
+		break;
+	default:
+		LOG_DBG("Unexpected threshold status");
+		break;
+	}
+
+	return idx;
+}
+
 void pump_failure_do(uint32_t thres_tbl_idx, uint32_t status)
 {
 	if (thres_tbl_idx >= ARRAY_SIZE(threshold_tbl))
@@ -859,6 +871,10 @@ void pump_failure_do(uint32_t thres_tbl_idx, uint32_t status)
 				      (sensor_num == SENSOR_NUM_PB_3_PUMP_TACH_RPM) ? 2 :
 										      0xFF;
 
+	uint8_t sticky_index = get_sticky_index(sensor_num, status);
+	if (sticky_index != 0xFF && !get_is_pump_not_access(pump_not_access_idx))
+		set_sticky_sensor_status(sticky_index, 1);
+
 	switch (status) {
 	case THRESHOLD_STATUS_NOT_ACCESS:
 		if (!get_is_pump_not_access(pump_not_access_idx)) {
@@ -887,6 +903,9 @@ void pump_failure_do(uint32_t thres_tbl_idx, uint32_t status)
 		LOG_DBG("Unexpected threshold warning");
 		break;
 	}
+
+	if (status != THRESHOLD_STATUS_NOT_ACCESS)
+		set_is_pump_not_access(pump_not_access_idx, false);
 
 	pump_board_tach_status_handler(sensor_num, status);
 }
@@ -934,6 +953,7 @@ void abnormal_flow_do(uint32_t thres_tbl_idx, uint32_t status)
 			thres_p->last_status = THRESHOLD_STATUS_NORMAL;
 			return;
 		}
+		set_sticky_sensor_status(STICKY_RPU_COOLANT_FLOW_BLOCKED, 1);
 		set_status_flag(STATUS_FLAG_FAILURE, PUMP_FAIL_ABNORMAL_FLOW_RATE, 1);
 		error_log_event(SENSOR_NUM_BPB_RPU_COOLANT_FLOW_RATE_LPM, IS_ABNORMAL_VAL);
 	} else if (status == THRESHOLD_STATUS_NOT_ACCESS) {

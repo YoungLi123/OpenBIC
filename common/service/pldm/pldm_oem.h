@@ -37,6 +37,9 @@ extern "C" {
 #define PLDM_OEM_READ_FILE_IO 0x03
 #define PLDM_OEM_SENSOR_POLLING_CMD 0x04
 #define PLDM_OEM_WF_READ_SPD_CHUNK 0x05
+#define PLDM_OEM_FORCE_UPDATE_SETTING_CMD 0x06
+#define PLDM_OEM_FORCE_UPDATE_GETTING_CMD 0x07
+#define PLDM_OEM_READ_FLASH_DATA_CMD 0x08
 
 #define POWER_CONTROL_LEN 0x01
 
@@ -104,6 +107,8 @@ enum oem_event_type {
 	OS_LOAD_WDT_PWR_CYCLE,
 	MTIA_FAULT,
 	POST_TIMEOUTED,
+	IRIS_FAULT,
+	ARKE_FAULT,
 };
 
 enum vr_event_source {
@@ -185,6 +190,136 @@ enum mtia_event_source {
 	MTIA_VR_FAULT_CAUSE_POWER_DOWN,
 	MTIA_ATH_GPIO_3,
 	MTIA_ATH_GPIO_4
+};
+enum iris_event_source {
+	// Send to BMC event data_1
+	// VR Power Fault 1
+	IRIS_HAMSA_VDDHRXTX_PCIE = 0,
+	IRIS_HAMSA_AVDD_PCIE,
+	IRIS_OWL_W_TRVDD0P75,
+	IRIS_OWL_E_TRVDD0P75,
+	IRIS_OWL_W_TRVDD0P9,
+	IRIS_OWL_E_TRVDD0P9,
+	// VR Power Fault 2
+	IRIS_MAX_N_VDD,
+	IRIS_MAX_M_VDD,
+	IRIS_MAX_S_VDD,
+	IRIS_HAMSA_VDD,
+	IRIS_OWL_W_VDD,
+	IRIS_OWL_E_VDD,
+	IRIS_MEDHA0_VDD,
+	IRIS_MEDHA1_VDD,
+	// VR Power Fault 3
+	IRIS_VDDPHY_HBM1_HBM3_HBM5_HBM7,
+	IRIS_VPP_HBM1_HBM3_HBM5_HBM7,
+	IRIS_VDDQC_HBM1_HBM3_HBM5_HBM7,
+	IRIS_VDDQL_HBM1_HBM3_HBM5_HBM7,
+	IRIS_VDDPHY_HBM0_HBM2_HBM4_HBM6,
+	IRIS_VPP_HBM0_HBM2_HBM4_HBM6,
+	IRIS_VDDQC_HBM0_HBM2_HBM4_HBM6,
+	IRIS_VDDQL_HBM0_HBM2_HBM4_HBM6,
+	// VR Power Fault 4
+	IRIS_P1V5_W_RVDD,
+	IRIS_P1V5_E_RVDD,
+	IRIS_P0V9_OWL_W_PVDD,
+	IRIS_P0V9_OWL_E_PVDD,
+	IRIS_PLL_VDDA15_HBM5_HBM7,
+	IRIS_PLL_VDDA15_HBM1_HBM3,
+	IRIS_PLL_VDDA15_HBM4_HBM6,
+	IRIS_PLL_VDDA15_HBM0_HBM2,
+	// VR Power Fault 5
+	IRIS_PVDD1P5,
+	IRIS_P1V5_PLL_VDDA_SOC,
+	IRIS_P1V5_PLL_VDDA_OWL,
+	IRIS_LDO_IN_1V2,
+	IRIS_P1V8,
+	IRIS_P3V3,
+	IRIS_P5V,
+	IRIS_P12V_UBC_PWRGD,
+	// VR Power Fault 1
+	IRIS_P0V75_AVDD_HCSL,
+	IRIS_4V2,
+	// VR SMbus alert
+	IRIS_MAX_N_VDDRXTX_SMBALRT_N = 0x31,
+	IRIS_VDDQC_VDDQL_0246_SMBALRT_N,
+	IRIS_MAX_M_VDDQC_1357_SMBALRT_N,
+	IRIS_OWL_W_SMBALRT_N,
+	IRIS_OWL_E_SMBALRT_N,
+	IRIS_MEDHA1_VDD_ALERT_R_N,
+	IRIS_MEDHA0_VDD_ALERT_R_N,
+	// Others
+	IRIS_POWER_ON_SEQUENCE_FAIL = 0x50,
+	IRIS_ASIC_THERMTRIP,
+	IRIS_MEDHA1_HBM_CATTRIP,
+	IRIS_MEDHA0_HBM_CATTRIP
+};
+
+enum arke_event_source {
+	// Send to BMC event data_1
+	// VR Power Fault 1
+	ARKE_HAMSA_VDDHRXTX_PCIE = 0,
+	ARKE_HAMSA_AVDD_PCIE,
+	ARKE_OWL_W_TRVDD0P75,
+	ARKE_OWL_E_TRVDD0P75,
+	ARKE_OWL_W_TRVDD0P9,
+	ARKE_OWL_E_TRVDD0P9,
+	// VR Power Fault 2
+	ARKE_MAX_N_VDD,
+	ARKE_MAX_M_VDD,
+	ARKE_MAX_S_VDD,
+	ARKE_HAMSA_VDD,
+	ARKE_OWL_W_VDD,
+	ARKE_OWL_E_VDD,
+	ARKE_NUWA0_VDD,
+	ARKE_NUWA1_VDD,
+	// VR Power Fault 3
+	ARKE_VDDPHY_HBM1_HBM3_HBM5_HBM7,
+	ARKE_VPP_HBM1_HBM3_HBM5_HBM7,
+	ARKE_VDDC_HBM1_HBM3_HBM5_HBM7,
+	ARKE_VDDQL_HBM1_HBM3_HBM5_HBM7,
+	ARKE_VDDPHY_HBM0_HBM2_HBM4_HBM6,
+	ARKE_VPP_HBM0_HBM2_HBM4_HBM6,
+	ARKE_VDDC_HBM0_HBM2_HBM4_HBM6,
+	ARKE_VDDQL_HBM0_HBM2_HBM4_HBM6,
+	// VR Power Fault 4
+	ARKE_P1V5_W_RVDD,
+	ARKE_P1V5_E_RVDD,
+	ARKE_P0V9_OWL_W_PVDD,
+	ARKE_P0V9_OWL_E_PVDD,
+	ARKE_P1V2_PLL_VDDA_SOC,
+	ARKE_P1V2_PLL_VDDA_OWL,
+	ARKE_VDDQ_HBM1_HBM3_HBM5_HBM7,
+	ARKE_VDDQ_HBM0_HBM2_HBM4_HBM6,
+	// VR Power Fault 5
+	ARKE_PVDD1P5,
+	ARKE_P1V5_PLL_VDDA_SOC,
+	ARKE_P1V5_PLL_VDDA_OWL,
+	ARKE_LDO_IN_1V2,
+	ARKE_P1V8,
+	ARKE_P3V3,
+	ARKE_P5V,
+	ARKE_P12V_UBC_PWRGD,
+	// VR Power Fault 1
+	ARKE_P0V75_AVDD_HCSL,
+	ARKE_4V2,
+	// VR SMbus alert
+	ARKE_VDDQ_1357_SMBALRT_N = 0x31,
+	ARKE_VDDQ_0246_SMBALRT_N,
+	ARKE_MAX_N_SMBALRT_N,
+	ARKE_VDDC_VDDQL_0246_SMBALRT_N,
+	ARKE_MAX_M_VDDC_1357_SMBALRT_N,
+	ARKE_OWL_W_SMBALRT_N,
+	ARKE_OWL_E_SMBALRT_N,
+	ARKE_NUWA1_VDD_ALERT_R_N,
+	ARKE_NUWA0_VDD_ALERT_R_N,
+	// Others
+	ARKE_POWER_ON_SEQUENCE_FAIL = 0x50,
+	ARKE_ASIC_THERMTRIP,
+	ARKE_NUWA1_HBM_CATTRIP,
+	ARKE_NUWA0_HBM_CATTRIP,
+	ARKE_HAMSA_CATTRIP,
+	ARKE_OWL_E_CATTRIP,
+	ARKE_OWL_W_CATTRIP,
 };
 
 enum READ_FILE_OPTION { READ_FILE_ATTR, READ_FILE_DATA };
@@ -286,9 +421,30 @@ struct _sensor_polling_cmd_resp {
 	uint8_t set_value;
 } __attribute__((packed));
 
+struct _force_update_flag_set_cmd_req {
+	uint8_t iana[IANA_LEN];
+	uint8_t set_value;
+} __attribute__((packed));
+
+struct _force_update_flag_set_cmd_resp {
+	uint8_t completion_code;
+	uint8_t iana[IANA_LEN];
+	uint8_t set_value;
+} __attribute__((packed));
+
+struct _force_update_flag_get_cmd_req {
+	uint8_t iana[IANA_LEN];
+} __attribute__((packed));
+
+struct _force_update_flag_get_cmd_resp {
+	uint8_t completion_code;
+	uint8_t iana[IANA_LEN];
+	uint8_t get_value;
+} __attribute__((packed));
+
 uint8_t check_iana(const uint8_t *iana);
 uint8_t set_iana(uint8_t *buf, uint8_t buf_len);
-uint8_t send_event_log_to_bmc(struct pldm_addsel_data msg);
+uint8_t send_event_log_to_bmc(struct pldm_addsel_data sel_msg);
 
 uint8_t pldm_oem_handler_query(uint8_t code, void **ret_fn);
 

@@ -19,6 +19,16 @@
 
 #include "stdint.h"
 
+enum RB_VR_VENDER_MODULE {
+	DELTA_UBC_AND_MPS_VR,
+	DELTA_UBC_AND_RNS_VR,
+	MPS_UBC_AND_MPS_VR,
+	MPS_UBC_AND_RNS_VR,
+	LUXSHURE_UBC_AND_MPS_VR,
+	LUXSHURE_UBC_AND_RNS_VR,
+	VENDOR_TYPE_UNKNOWN,
+};
+
 enum VR_MODULE {
 	VR_MODULE_MPS,
 	VR_MODULE_RNS,
@@ -33,9 +43,44 @@ enum UBC_MODULE {
 	UBC_MODULE_UNKNOWN,
 };
 
+enum TMP_MODULE {
+	TMP_TMP432,
+	TMP_EMC1413,
+	TMP_TYPE_UNKNOWN,
+};
+
+enum ASIC_BOARD_ID {
+	ASIC_BOARD_ID_RSVD1,
+	ASIC_BOARD_ID_RSVD2,
+	ASIC_BOARD_ID_RAINBOW,
+	ASIC_BOARD_ID_EVB,
+	ASIC_BOARD_ID_UNKNOWN,
+};
+
+enum ASIC_TYPE {
+	ASIC_TYPE_QCP1,
+	ASIC_TYPE_QCP2,
+	ASIC_TYPE_UNKNOWN,
+};
+
+enum REV_ID {
+	REV_ID_EVT1A,
+	REV_ID_EVT1B,
+	REV_ID_EVT2,
+	REV_ID_DVT_FAB3,
+	REV_ID_DVT_FAB4,
+	REV_ID_PVT,
+	REV_ID_MP,
+	MAX_REV_ID,
+};
+
 void init_plat_config();
 uint8_t get_vr_module();
 uint8_t get_ubc_module();
 uint8_t get_mmc_slot();
-
+uint8_t get_asic_board_id();
+uint8_t get_board_rev_id();
+uint8_t get_tray_location();
+uint8_t get_asic_type();
+bool plat_cpld_eerprom_read(uint8_t *data, uint16_t offset, uint8_t len);
 #endif

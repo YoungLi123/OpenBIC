@@ -29,6 +29,7 @@
 #include "plat_gpio.h"
 #include "emc1413.h"
 #include "plat_event.h"
+#include "hal_i2c.h"
 
 LOG_MODULE_REGISTER(plat_pldm_sensor);
 
@@ -37,6 +38,7 @@ static bool plat_sensor_ubc_polling_enable_flag = true;
 static bool plat_sensor_temp_polling_enable_flag = true;
 static bool plat_sensor_vr_polling_enable_flag = true;
 
+void plat_pldm_sensor_change_ubc_addr();
 void plat_pldm_sensor_change_ubc_dev();
 void plat_pldm_sensor_change_ubc_init_args();
 void plat_pldm_sensor_change_vr_dev();
@@ -3709,7 +3711,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			432, //uint32_t critical_high;
+			440, //uint32_t critical_high;
 			368, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -3783,7 +3785,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0x00000000, //uint32_t warning_high; //Need to check
 			0x00000000, //uint32_t warning_low; //Need to check
-			12500, //uint32_t critical_high; //Need to check
+			18000, //uint32_t critical_high; //Need to check
 			0x00000000, //uint32_t critical_low; //Need to check
 			0x00000000, //uint32_t fatal_high; //Need to check
 			0x00000000, //uint32_t fatal_low; //Need to check
@@ -3857,7 +3859,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0x00000000, //uint32_t warning_high; //Need to check
 			0x00000000, //uint32_t warning_low; //Need to check
-			5000, //uint32_t critical_high; //Need to check
+			7400, //uint32_t critical_high; //Need to check
 			0x00000000, //uint32_t critical_low; //Need to check
 			0x00000000, //uint32_t fatal_high; //Need to check
 			0x00000000, //uint32_t fatal_low; //Need to check
@@ -5469,7 +5471,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0, //uint32_t warning_high;
 			0, //uint32_t warning_low;
-			432, //uint32_t critical_high;
+			440, //uint32_t critical_high;
 			368, //uint32_t critical_low;
 			0, //uint32_t fatal_high;
 			0, //uint32_t fatal_low;
@@ -5543,7 +5545,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0x00000000, //uint32_t warning_high; //Need to check
 			0x00000000, //uint32_t warning_low; //Need to check
-			12500, //uint32_t critical_high; //Need to check
+			18000, //uint32_t critical_high; //Need to check
 			0x00000000, //uint32_t critical_low; //Need to check
 			0x00000000, //uint32_t fatal_high; //Need to check
 			0x00000000, //uint32_t fatal_low; //Need to check
@@ -5617,7 +5619,7 @@ pldm_sensor_info plat_pldm_sensor_vr_table[] = {
 			0x00000000, //uint32_t normal_min;
 			0x00000000, //uint32_t warning_high; //Need to check
 			0x00000000, //uint32_t warning_low; //Need to check
-			5000, //uint32_t critical_high; //Need to check
+			7400, //uint32_t critical_high; //Need to check
 			0x00000000, //uint32_t critical_low; //Need to check
 			0x00000000, //uint32_t fatal_high; //Need to check
 			0x00000000, //uint32_t fatal_low; //Need to check
@@ -9200,6 +9202,7 @@ pldm_sensor_info *plat_pldm_sensor_load(int thread_id)
 {
 	switch (thread_id) {
 	case UBC_SENSOR_THREAD_ID:
+		plat_pldm_sensor_change_ubc_addr();
 		plat_pldm_sensor_change_ubc_dev();
 		plat_pldm_sensor_change_ubc_init_args();
 		return plat_pldm_sensor_ubc_table;
@@ -9797,6 +9800,55 @@ void plat_pldm_sensor_change_temp_addr()
 	}
 }
 
+bool plat_check_ubc1_addr()
+{
+	I2C_MSG i2c_msg = { 0 };
+	uint8_t retry = 5;
+	i2c_msg.bus = I2C_BUS1;
+	i2c_msg.target_addr = UBC1_ADDR;
+	i2c_msg.tx_len = 1;
+	i2c_msg.rx_len = 1;
+	i2c_msg.data[0] = 0x00;
+
+	if (i2c_master_read(&i2c_msg, retry)) {
+		// UBC1_2ND_ADDR if  UBC1_ADDR read fail
+		LOG_INF("UBC1 ADDR 0x%02X read fail, change to use 0x%02X for UBC1", UBC1_ADDR,
+			UBC1_2ND_ADDR);
+		return false;
+	}
+
+	return true;
+}
+
+void plat_pldm_sensor_change_ubc_addr()
+{
+	uint8_t ubc_type = get_ubc_type();
+
+	if (ubc_type == UBC_UNKNOWN) {
+		LOG_ERR("Unable to check the UBC ADDR due to its unknown status.");
+		return;
+	}
+
+	if (ubc_type == UBC_DELTA_S54SS4P180PMDCF) {
+		LOG_INF("Check ubc addr for UBC_DELTA_S54SS4P180PMDCF");
+		if (plat_check_ubc1_addr() == false) {
+			for (int index = 0;
+			     index < plat_pldm_sensor_get_sensor_count(UBC_SENSOR_THREAD_ID);
+			     index++) {
+				if ((plat_pldm_sensor_ubc_table[index].pldm_sensor_cfg.target_addr ==
+				     UBC1_ADDR)) {
+					plat_pldm_sensor_ubc_table[index]
+						.pldm_sensor_cfg.target_addr = UBC1_2ND_ADDR;
+					LOG_INF("UBC1 sensor %d ADDR change to 0x%02X for UBC_DELTA_S54SS4P180PMDCF",
+						plat_pldm_sensor_ubc_table[index]
+							.pldm_sensor_cfg.num,
+						UBC1_2ND_ADDR);
+				}
+			}
+		}
+	}
+}
+
 void plat_pldm_sensor_change_ubc_dev()
 {
 	uint8_t ubc_type = get_ubc_type();
@@ -9914,13 +9966,14 @@ bool is_ubc_access(uint8_t sensor_num)
 	/* is_ubc_enabled_delayed_enabled() is to wait for all VR to be enabled  */
 	/* (gpio_get(FM_PLD_UBC_EN_R) == GPIO_HIGH) is to shut down polling immediately when UBC is disabled */
 	return ((gpio_get(FM_PLD_UBC_EN_R) == GPIO_HIGH) && is_ubc_enabled_delayed_enabled() &&
-		get_plat_sensor_ubc_polling_enable_flag() && get_plat_sensor_polling_enable_flag());
+		get_plat_sensor_ubc_polling_enable_flag() &&
+		get_plat_sensor_polling_enable_flag() && is_update_state_idle());
 }
 
 bool is_temp_access(uint8_t cfg_idx)
 {
 	return (get_plat_sensor_temp_polling_enable_flag() &&
-		get_plat_sensor_polling_enable_flag());
+		get_plat_sensor_polling_enable_flag() && is_update_state_idle());
 }
 
 bool is_vr_access(uint8_t sensor_num)
@@ -9928,7 +9981,8 @@ bool is_vr_access(uint8_t sensor_num)
 	/* is_ubc_enabled_delayed_enabled() is to wait for all VR to be enabled when UBC is enabled  */
 	/* (gpio_get(FM_PLD_UBC_EN_R) == GPIO_HIGH) is to shut down polling immediately when UBC is disabled */
 	return ((gpio_get(FM_PLD_UBC_EN_R) == GPIO_HIGH) && is_ubc_enabled_delayed_enabled() &&
-		get_plat_sensor_vr_polling_enable_flag() && get_plat_sensor_polling_enable_flag());
+		get_plat_sensor_vr_polling_enable_flag() && get_plat_sensor_polling_enable_flag() &&
+		is_update_state_idle());
 }
 
 bool get_sensor_info_by_sensor_id(uint8_t sensor_id, uint8_t *vr_bus, uint8_t *vr_addr,

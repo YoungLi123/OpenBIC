@@ -28,11 +28,33 @@
 #include "plat_class.h"
 #include "plat_cpld.h"
 #include "plat_log.h"
+#include "plat_user_setting.h"
+#include "plat_pldm_monitor.h"
+#include "plat_hwmon.h"
+#include "plat_ioexp.h"
+#include "plat_thermal.h"
+#include "plat_gpio.h"
+#include "plat_event.h"
+#include "plat_vr_test_mode.h"
+#include "plat_power_capping.h"
+#include "plat_isr.h"
 
 LOG_MODULE_REGISTER(plat_init);
 
 void pal_pre_init()
 {
+	// check if dc off
+	if (is_mb_dc_on() == false) {
+		// set pinmux for A12 to default gpio output low
+		plat_switch_pin_a12(true); /* LOW -> A12 = GPIO73 output low */
+
+	}
+	// if DC on
+	else {
+		plat_switch_pin_a12(false); /* HIGH -> A12 = SPIP1_CS */
+		set_clock_u87_u88_lphcsl_amp_ctrl_to_1v();
+	}
+
 	/* init i2c target */
 	for (int index = 0; index < MAX_TARGET_NUM; index++) {
 		if (I2C_TARGET_ENABLE_TABLE[index])
@@ -43,7 +65,8 @@ void pal_pre_init()
 	init_plat_config();
 	plat_led_init();
 	vr_mutex_init();
-	plat_i3c_set_pid();
+	pwr_level_mutex_init();
+	init_pwm_dev();
 }
 
 void pal_set_sys_status()
@@ -54,12 +77,36 @@ void pal_set_sys_status()
 void pal_post_init()
 {
 	plat_mctp_init();
+	user_settings_init();
+	pldm_load_state_effecter_table(MAX_STATE_EFFECTER_IDX);
+	pldm_assign_gpio_effecter_id(PLAT_EFFECTER_ID_GPIO_HIGH_BYTE);
 	init_fru_info();
-	uint8_t data = 0;
-	plat_write_cpld(CPLD_OFFSET_POWER_CLAMP, &data);
-	plat_adc_init();
+	plat_adc_rainbow_init();
+	plat_power_capping_init();
 	init_load_eeprom_log();
+	if (get_asic_board_id() == ASIC_BOARD_ID_EVB && get_board_rev_id() >= REV_ID_EVT1B) {
+		// if board id >= EVB EVT1B(FAB2)
+		init_U200052_IO();
+		init_U200053_IO();
+		// if board id >= EVB EVT1B(FAB3)
+		if (get_board_rev_id() >= REV_ID_EVT2)
+			init_U200070_IO();
+	}
+	quick_sensor_poll_init();
+	// check bootstrap flag
+	check_bootstrap_flag();
+	plat_set_ac_on_log();
+
 	init_cpld_polling();
+	plat_telemetry_table_init();
+	ioexp_init();
+	init_thermal_polling();
+	init_vr_test_mode_polling();
+	// check the thermtrip open-circuit
+	if (!gpio_get(FM_ASIC_0_THERMTRIP_R_N))
+		asic_thermtrip_error_log(LOG_ASSERT);
+	// check clk 312.5Mhz init
+	check_312_5MHz_init_status();
 }
 
 #define DEF_PROJ_GPIO_PRIORITY 78

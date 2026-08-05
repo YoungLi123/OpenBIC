@@ -352,15 +352,18 @@ uint8_t modbus_pump_setting(modbus_command_mapping *cmd)
 
 	if (cmd->data[0] == 9) // enable auto mode, reset p0p1 error flag
 	{
-		set_is_rack_level_abnormal(false);
-		set_is_rpu_level_abnormal(false);
-		set_is_press_abnormal(false);
 		set_is_hsc_hsc_fail(false);
+		//clean boolean status(pump not access)
 		set_is_pump_not_access(0, false);
 		set_is_pump_not_access(1, false);
 		set_is_pump_not_access(2, false);
+		//clean boolean status(fan not access)
+		for (uint8_t i = 0; i < 14; i++) {
+			set_is_fan_not_access(i, false);
+		}
 		// restore leak led
-		led_ctrl(LED_IDX_E_LEAK, LED_STOP_BLINK);
+		led_ctrl(LED_IDX_E_LEAK, LED_STOP_BLINK); // only stop blind behavior
+		led_ctrl(LED_IDX_E_LEAK, LED_TURN_OFF); // default led status(turn off)
 		set_status_flag(STATUS_FLAG_FAILURE, GPIO_FAIL_BPB_HSC, 0);
 		for (uint8_t i = PUMP_FAIL_EMERGENCY_BUTTON; i <= PUMP_FAIL_CLOSE_PUMP; i++) {
 			set_status_flag(STATUS_FLAG_FAILURE, i, 0);
@@ -523,6 +526,75 @@ uint8_t modbus_set_sticky_sensor_status(modbus_command_mapping *cmd)
 		return MODBUS_EXC_NONE;
 	else
 		return MODBUS_EXC_SERVER_DEVICE_FAILURE;
+}
+
+uint8_t modbus_set_sticky_bit_sensor_status(modbus_command_mapping *cmd)
+{
+	CHECK_NULL_ARG_WITH_RETURN(cmd, MODBUS_EXC_ILLEGAL_DATA_VAL);
+	uint8_t start, end;
+	switch (cmd->addr) {
+	case MODBUS_STICKY_PUMP_1_ABNORMAL_ADDR:
+		start = STICKY_PUMP_1_SPEED_ABNORMAL;
+		end = STICKY_PUMP_1_SPEED_NOT_ACCESS;
+		break;
+	case MODBUS_STICKY_PUMP_2_ABNORMAL_ADDR:
+		start = STICKY_PUMP_2_SPEED_ABNORMAL;
+		end = STICKY_PUMP_2_SPEED_NOT_ACCESS;
+		break;
+	case MODBUS_STICKY_PUMP_3_ABNORMAL_ADDR:
+		start = STICKY_PUMP_3_SPEED_ABNORMAL;
+		end = STICKY_PUMP_3_SPEED_NOT_ACCESS;
+		break;
+	case MODBUS_STICKY_P1_ERROR_SETTING_ADDR:
+		start = STICKY_HEX_BLADDER_ABNORMAL;
+		end = STICKY_PUMP_3_SPEED_UCR;
+		break;
+	default:
+		return MODBUS_EXC_ILLEGAL_DATA_ADDR;
+	}
+
+	for (uint8_t i = start; i <= end; i++) {
+		uint8_t bit_status = (cmd->data[0] & BIT(i - start)) ? 1 : 0;
+		if (!set_sticky_sensor_status(i, bit_status))
+			return MODBUS_EXC_SERVER_DEVICE_FAILURE;
+	}
+
+	return MODBUS_EXC_NONE;
+}
+
+uint8_t modbus_get_sticky_bit_sensor_status(modbus_command_mapping *cmd)
+{
+	CHECK_NULL_ARG_WITH_RETURN(cmd, MODBUS_EXC_ILLEGAL_DATA_VAL);
+
+	uint8_t start, end;
+	switch (cmd->addr) {
+	case MODBUS_STICKY_PUMP_1_ABNORMAL_ADDR:
+		start = STICKY_PUMP_1_SPEED_ABNORMAL;
+		end = STICKY_PUMP_1_SPEED_NOT_ACCESS;
+		break;
+	case MODBUS_STICKY_PUMP_2_ABNORMAL_ADDR:
+		start = STICKY_PUMP_2_SPEED_ABNORMAL;
+		end = STICKY_PUMP_2_SPEED_NOT_ACCESS;
+		break;
+	case MODBUS_STICKY_PUMP_3_ABNORMAL_ADDR:
+		start = STICKY_PUMP_3_SPEED_ABNORMAL;
+		end = STICKY_PUMP_3_SPEED_NOT_ACCESS;
+		break;
+	case MODBUS_STICKY_P1_ERROR_SETTING_ADDR:
+		start = STICKY_HEX_BLADDER_ABNORMAL;
+		end = STICKY_PUMP_3_SPEED_UCR;
+		break;
+	default:
+		return MODBUS_EXC_ILLEGAL_DATA_ADDR;
+	}
+
+	uint16_t val = 0;
+	for (uint8_t i = start; i <= end; i++) {
+		WRITE_BIT(val, i - start, (get_sticky_sensor_status(i)) ? 1 : 0);
+	}
+
+	cmd->data[0] = val;
+	return MODBUS_EXC_NONE;
 }
 
 uint8_t modbus_get_sticky_sensor_status(modbus_command_mapping *cmd)
@@ -743,7 +815,7 @@ uint8_t modbus_get_setpoint(modbus_command_mapping *cmd)
 {
 	CHECK_NULL_ARG_WITH_RETURN(cmd, MODBUS_EXC_ILLEGAL_DATA_VAL);
 
-	cmd->data[0] = get_fsc_setpoint(cmd->arg0);
+	cmd->data[0] = (uint16_t)(get_fsc_setpoint(cmd->arg0) / cmd->arg1 / pow_of_10(cmd->arg2));
 
 	return MODBUS_EXC_NONE;
 }
@@ -751,9 +823,9 @@ uint8_t modbus_set_setpoint(modbus_command_mapping *cmd)
 {
 	CHECK_NULL_ARG_WITH_RETURN(cmd, MODBUS_EXC_ILLEGAL_DATA_VAL);
 
-	set_fsc_setpoint(cmd->arg0, (uint8_t)cmd->data[0]);
+	set_fsc_setpoint(cmd->arg0, (float)cmd->data[0] * cmd->arg1 * pow_of_10(cmd->arg2));
 	uint8_t idx = cmd->arg0;
-	set_fsc_setpoint(idx, (uint8_t)cmd->data[0]);
+	set_fsc_setpoint(idx, (float)cmd->data[0] * cmd->arg1 * pow_of_10(cmd->arg2));
 	if ((get_status_flag(STATUS_FLAG_SETPOINT_FLAG) && BIT(idx))) {
 		switch (idx) {
 		case SETPOINT_FLAG_LPM:
@@ -797,6 +869,31 @@ uint8_t modbus_set_setpoint_enable(modbus_command_mapping *cmd)
 	default:
 		return MODBUS_EXC_ILLEGAL_DATA_VAL;
 	};
+
+	return MODBUS_EXC_NONE;
+}
+
+uint8_t modbus_get_pump_redundant_switch_day(modbus_command_mapping *cmd)
+{
+	CHECK_NULL_ARG_WITH_RETURN(cmd, MODBUS_EXC_ILLEGAL_DATA_VAL);
+
+	if (get_pump_redundant_switch_time_type())
+		cmd->data[0] = (uint16_t)((double)get_pump_redundant_switch_time() / 1440.0 + 0.5);
+	else
+		cmd->data[0] = get_pump_redundant_switch_time();
+
+	return MODBUS_EXC_NONE;
+}
+uint8_t modbus_set_pump_redundant_switch_day(modbus_command_mapping *cmd)
+{
+	CHECK_NULL_ARG_WITH_RETURN(cmd, MODBUS_EXC_ILLEGAL_DATA_VAL);
+
+	if (!cmd->data[0])
+		return MODBUS_EXC_ILLEGAL_DATA_VAL;
+	else {
+		set_pump_redundant_switch_time_type(0);
+		set_pump_redundant_switch_time(cmd->data[0]);
+	}
 
 	return MODBUS_EXC_NONE;
 }
@@ -1376,9 +1473,11 @@ modbus_command_mapping modbus_command_table[] = {
 	  modbus_get_setpoint_enable, SETPOINT_FLAG_OUTLET_TEMP, 0, 0, 1 },
 	// Control
 	{ MODBUS_AUTO_TUNE_COOLANT_FLOW_RATE_TARGET_SET_ADDR, modbus_set_setpoint,
-	  modbus_get_setpoint, SETPOINT_FLAG_LPM, 0, 0, 1 },
+	  modbus_get_setpoint, SETPOINT_FLAG_LPM, 1, -1, 1 },
 	{ MODBUS_AUTO_TUNE_COOLANT_OUTLET_TEMPERATURE_TARGET_SET_ADDR, modbus_set_setpoint,
-	  modbus_get_setpoint, SETPOINT_FLAG_OUTLET_TEMP, 0, 0, 1 },
+	  modbus_get_setpoint, SETPOINT_FLAG_OUTLET_TEMP, 1, -1, 1 },
+	{ MODBUS_PUMP_REDUNDANT_SWITCHED_INTERVAL_ADDR, modbus_set_pump_redundant_switch_day,
+	  modbus_get_pump_redundant_switch_day, SETPOINT_FLAG_LPM, 0, 0, 1 },
 	{ MODBUS_MANUAL_CONTROL_PUMP_DUTY_SET_ADDR, modbus_set_manual_pwm, modbus_get_manual_pwm,
 	  MANUAL_PWM_E_PUMP, 0, 0, 1 },
 	{ MODBUS_MANUAL_CONTROL_FAN_DUTY_SET_ADDR, modbus_set_manual_pwm, modbus_get_manual_pwm,
@@ -1400,6 +1499,15 @@ modbus_command_mapping modbus_command_table[] = {
 	{ MODBUS_MANUAL_CONTROL_RPU_PCB_FAN_DUTY_SET_ADDR, modbus_set_manual_pwm,
 	  modbus_get_manual_pwm, MANUAL_PWM_E_RPU_PCB_FAN, 0, 0, 1 },
 	{ MODBUS_PUMP_SETTING_ADDR, modbus_pump_setting, modbus_pump_setting_get, 0, 0, 0, 1 },
+	// Sticky P1 Error
+	{ MODBUS_STICKY_PUMP_1_ABNORMAL_ADDR, modbus_set_sticky_bit_sensor_status,
+	  modbus_get_sticky_bit_sensor_status, 0, 0, 0, 1 },
+	{ MODBUS_STICKY_PUMP_2_ABNORMAL_ADDR, modbus_set_sticky_bit_sensor_status,
+	  modbus_get_sticky_bit_sensor_status, 0, 0, 0, 1 },
+	{ MODBUS_STICKY_PUMP_3_ABNORMAL_ADDR, modbus_set_sticky_bit_sensor_status,
+	  modbus_get_sticky_bit_sensor_status, 0, 0, 0, 1 },
+	{ MODBUS_STICKY_P1_ERROR_SETTING_ADDR, modbus_set_sticky_bit_sensor_status,
+	  modbus_get_sticky_bit_sensor_status, 0, 0, 0, 1 },
 	// Leakage Black Box
 	{ MODBUS_STICKY_ITRACK_CHASSIS0_LEAKAGE_ADDR, modbus_set_sticky_sensor_status,
 	  modbus_get_sticky_sensor_status, STICKY_ITRACK_CHASSIS0_LEAKAGE, 0, 0, 1 },

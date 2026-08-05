@@ -164,6 +164,11 @@ typedef struct __attribute__((__packed__)) {
 	uint16_t set_value_LC;
 } plat_power_capping_set;
 
+typedef struct __attribute__((__packed__)) {
+	struct k_work work;
+	uint16_t set_value;
+} plat_power_capping_switch;
+
 static uint8_t bootstrap_pin;
 static uint8_t user_setting_level;
 
@@ -270,6 +275,15 @@ void set_power_capping_handler(struct k_work *work_item)
 	plat_set_power_capping_command(POWER_CAPPING_INDEX_HC, &set_value_HC, false);
 	plat_set_power_capping_command(POWER_CAPPING_INDEX_LC, &set_value_LC, false);
 	// LOG_DBG("Power capping set HC: %d, LC: %d", set_value_HC, set_value_LC);
+}
+
+void set_power_capping_switch_handler(struct k_work *work_item)
+{
+	const plat_power_capping_switch *sensor_data =
+		CONTAINER_OF(work_item, plat_power_capping_switch, work);
+
+	uint16_t set_value = sensor_data->set_value;
+	plat_set_power_capping_command(POWER_CAPPING_INDEX_SWITCH, &set_value, false);
 }
 
 bool get_fru_info_element(telemetry_info *telemetry_info, char **fru_element,
@@ -896,6 +910,43 @@ static bool command_reply_data_handle(void *arg)
 				memcpy(data->target_rd_msg.msg, &power, sizeof(power));
 				data->target_rd_msg.msg_length = sizeof(power);
 			} break;
+			case POWER_CAPPING_GET_VR_ASIC_SUM_PWR_W_REG: {
+				static const uint16_t power_sum_sensor_ids[] = {
+					VR_ASIC_P0V85_PVDD_PWR_W,
+					VR_ASIC_P0V9_TRVDD_ZONEA_PWR_W,
+					VR_ASIC_P0V75_TRVDD_ZONEA_PWR_W,
+					VR_ASIC_P0V75_PVDD_CH_N_PWR_W,
+					VR_ASIC_P0V75_MAX_PHY_N_PWR_W,
+					VR_ASIC_P0V9_TRVDD_ZONEB_PWR_W,
+					VR_ASIC_P0V75_TRVDD_ZONEB_PWR_W,
+					VR_ASIC_P0V75_PVDD_CH_S_PWR_W,
+					VR_ASIC_P0V75_MAX_PHY_S_PWR_W,
+					VR_ASIC_P0V8_VDDA_PCIE_PWR_W,
+					VR_ASIC_P1V2_VDDHTX_PCIE_PWR_W,
+					VR_ASIC_P1V1_VDDC_HBM0_HBM2_HBM4_PWR_W,
+					VR_ASIC_P0V4_VDDQL_HBM0_HBM2_HBM4_PWR_W,
+					VR_ASIC_P1V8_VPP_HBM0_HBM2_HBM4_PWR_W,
+					VR_ASIC_P0V75_VDDPHY_HBM0_HBM2_HBM4_PWR_W,
+					VR_ASIC_P1V1_VDDC_HBM1_HBM3_HBM5_PWR_W,
+					VR_ASIC_P0V4_VDDQL_HBM1_HBM3_HBM5_PWR_W,
+					VR_ASIC_P1V8_VPP_HBM1_HBM3_HBM5_PWR_W,
+					VR_ASIC_P0V75_VDDPHY_HBM1_HBM3_HBM5_PWR_W,
+				};
+				uint32_t sum_mw = 0;
+				for (int i = 0; i < ARRAY_SIZE(power_sum_sensor_ids); i++) {
+					int reading = 0;
+					uint8_t sensor_operational_state = PLDM_SENSOR_STATUSUNKOWN;
+					uint8_t status = pldm_sensor_get_reading_from_cache(
+						power_sum_sensor_ids[i], &reading,
+						&sensor_operational_state);
+					if (status == SENSOR_READ_SUCCESS && reading > 0) {
+						sum_mw += reading;
+					}
+				}
+				uint16_t power_sum_w = (uint16_t)(sum_mw / 1000);
+				memcpy(data->target_rd_msg.msg, &power_sum_w, sizeof(power_sum_w));
+				data->target_rd_msg.msg_length = sizeof(power_sum_w);
+			} break;
 			default:
 				LOG_ERR("Unknown reg offset: 0x%02x", reg_offset);
 				data->target_rd_msg.msg_length = 1;
@@ -1017,6 +1068,21 @@ void plat_master_write_thread_handler()
 			sensor_data->set_value_HC = rdata[1] | (rdata[2] << 8);
 			sensor_data->set_value_LC = rdata[3] | (rdata[4] << 8);
 			k_work_init(&sensor_data->work, set_power_capping_handler);
+			k_work_submit(&sensor_data->work);
+		} break;
+		case POWER_CAPPING_SWITCH_ENABLE_REG: {
+			if (rlen != 2) {
+				LOG_ERR("Invalid length for offset: 0x%02x", reg_offset);
+				break;
+			}
+			plat_power_capping_switch *sensor_data =
+				malloc(sizeof(plat_power_capping_switch));
+			if (!sensor_data) {
+				LOG_ERR("Memory allocation failed!");
+				break;
+			}
+			sensor_data->set_value = rdata[1] & 0x01;
+			k_work_init(&sensor_data->work, set_power_capping_switch_handler);
 			k_work_submit(&sensor_data->work);
 		} break;
 		case SET_SENSOR_POLLING_COMMAND_REG: {

@@ -27,6 +27,7 @@ LOG_MODULE_REGISTER(raa228249);
 
 #define raa228249_READ_VOUT_RESOLUTION 0.001
 #define raa228249_READ_IOUT_RESOLUTION 0.1
+#define raa228249_READ_VIN_RESOLUTION 0.01
 
 // RAA GEN3p5
 #define VR_RAA_REG_REMAIN_WR 0x35
@@ -35,6 +36,7 @@ LOG_MODULE_REGISTER(raa228249);
 #define VR_RAA_REG_PROG_STATUS 0x83
 #define VR_RAA_REG_CRC 0xF8
 #define VR_RAA_REG_DEVID 0xAD
+#define VR_RAA_REG_IOUT_EVENT 0xE89E
 
 #define VR_RAA_DEV_ID_LEN 4
 #define VR_RAA_DEV_REV_LEN 4
@@ -228,6 +230,37 @@ static int raa_dma_rd(uint8_t bus, uint8_t addr, uint8_t *reg, uint8_t *resp)
 	}
 
 	memcpy(resp, &i2c_msg.data[0], i2c_msg.rx_len);
+	return 0;
+}
+
+static int raa_dma_wt(uint8_t bus, uint8_t addr, uint8_t *reg, uint8_t *txdata)
+{
+	CHECK_NULL_ARG_WITH_RETURN(reg, SENSOR_UNSPECIFIED_ERROR);
+	CHECK_NULL_ARG_WITH_RETURN(txdata, SENSOR_UNSPECIFIED_ERROR);
+
+	I2C_MSG i2c_msg = { 0 };
+	uint8_t retry = 3;
+
+	i2c_msg.bus = bus;
+	i2c_msg.target_addr = addr;
+	i2c_msg.tx_len = 3;
+	i2c_msg.data[0] = VR_RAA_REG_DMA_ADDR;
+	memcpy(&i2c_msg.data[1], reg, 2);
+
+	if (i2c_master_write(&i2c_msg, retry)) {
+		LOG_ERR("write register 0x%02X failed", reg[0]);
+		return -1;
+	}
+
+	i2c_msg.tx_len = 5;
+	i2c_msg.data[0] = VR_RAA_REG_DMA_DATA;
+	memcpy(&i2c_msg.data[1], txdata, 4);
+
+	if (i2c_master_write(&i2c_msg, retry)) {
+		LOG_ERR("write register 0x%02X failed", reg[0]);
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -518,6 +551,49 @@ bool raa228249_set_vout_command(sensor_cfg *cfg, uint8_t rail, uint16_t *millivo
 	return true;
 }
 
+bool raa228249_get_iout_oc_warn_limit(sensor_cfg *cfg, uint16_t *value)
+{
+	CHECK_NULL_ARG_WITH_RETURN(cfg, false);
+	CHECK_NULL_ARG_WITH_RETURN(value, false);
+
+	uint8_t rdata[4] = { 0 };
+	uint8_t txreg[2] = { VR_RAA_REG_IOUT_EVENT & 0xFF, VR_RAA_REG_IOUT_EVENT >> 8 };
+	if (raa_dma_rd(cfg->port, cfg->target_addr, txreg, rdata) < 0) {
+		LOG_ERR("get IOUT EVENT fail");
+		return false;
+	}
+
+	// 1 unit = 0.1A
+	*value = (rdata[0] | (rdata[1] << 8)) * 0.1;
+	return true;
+}
+
+bool raa228249_set_iout_oc_warn_limit(sensor_cfg *cfg, uint16_t value)
+{
+	CHECK_NULL_ARG_WITH_RETURN(cfg, false);
+
+	uint8_t txdata[4] = { 0 };
+	uint8_t txreg[2] = { VR_RAA_REG_IOUT_EVENT & 0xFF, VR_RAA_REG_IOUT_EVENT >> 8 };
+	uint16_t temp_val = value * 10;
+
+	/* read first, don't change byte 2 and 3 */
+	if (raa_dma_rd(cfg->port, cfg->target_addr, txreg, txdata) < 0) {
+		LOG_ERR("w get IOUT EVENT fail");
+		return false;
+	}
+
+	/* input value unit: 0.1A */
+	txdata[0] = temp_val & 0xFF;
+	txdata[1] = temp_val >> 8;
+
+	if (raa_dma_wt(cfg->port, cfg->target_addr, txreg, txdata) < 0) {
+		LOG_ERR("set IOUT EVENT fail");
+		return false;
+	}
+
+	return true;
+}
+
 bool raa228249_get_vr_status(sensor_cfg *cfg, uint8_t rail, uint8_t vr_status_rail,
 			     uint16_t *vr_status)
 {
@@ -652,6 +728,11 @@ uint8_t raa228249_read(sensor_cfg *cfg, int *reading)
 		/* 2's complement */
 		int16_t read_value = (msg.data[1] << 8) | msg.data[0];
 		val = read_value * raa228249_READ_IOUT_RESOLUTION;
+
+	} else if (cfg->offset == PMBUS_READ_VIN) {
+		/* 2's complement */
+		int16_t read_value = (msg.data[1] << 8) | msg.data[0];
+		val = read_value * raa228249_READ_VIN_RESOLUTION;
 
 	} else {
 		return SENSOR_FAIL_TO_ACCESS;

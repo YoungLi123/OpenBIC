@@ -4,7 +4,7 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
@@ -16,16 +16,19 @@
 
 #include "plat_ipmi.h"
 
+#include "eeprom.h"
+#include "fru.h"
+#include "hal_gpio.h"
+#include "ipmi.h"
+#include "power_status.h"
+#include "libutil.h"
+#include "plat_class.h"
+#include "plat_fru.h"
+#include "plat_ipmb.h"
+#include "plat_dimm.h"
+#include <logging/log.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <logging/log.h>
-#include "libutil.h"
-#include "ipmi.h"
-#include "fru.h"
-#include "eeprom.h"
-#include "plat_fru.h"
-#include "plat_class.h"
-#include "plat_ipmb.h"
 
 LOG_MODULE_REGISTER(plat_ipmi);
 
@@ -136,5 +139,293 @@ void OEM_1S_GET_CARD_TYPE(ipmi_msg *msg)
 		break;
 	}
 
+	return;
+}
+
+void OEM_1S_GET_GPIO_CONFIG(ipmi_msg *msg)
+{
+	CHECK_NULL_ARG(msg);
+	if (msg->data_len == 0) {
+		msg->completion_code = CC_INVALID_LENGTH;
+		return;
+	}
+
+	uint8_t idx = 0;
+	uint8_t bitmap_len = msg->data_len;
+	uint8_t *gpio_bitmap = (uint8_t *)malloc(bitmap_len * sizeof(uint8_t));
+	if (gpio_bitmap == NULL) {
+		return;
+	}
+	memcpy(gpio_bitmap, &msg->data[0], bitmap_len);
+
+	for (uint8_t num = 0; num < gpio_ind_to_num_table_cnt; num++) {
+		if (num / BITS_PER_BYTE >= bitmap_len) {
+			break;
+		}
+
+		uint8_t byte = msg->data[num / BITS_PER_BYTE];
+		uint8_t pin_mask = (1 << (num % BITS_PER_BYTE));
+		if (!(byte & pin_mask)) {
+			continue;
+		}
+
+		uint8_t gpio_num = gpio_ind_to_num_table[num];
+		uint8_t cfg_byte = 0;
+
+		uint8_t dir = (uint8_t)gpio_get_direction(gpio_num);
+		cfg_byte |= (dir & 0x1u) << GPIO_CONF_SET_DIR;
+
+		uint8_t interrupt_en = gpio_get_reg_value(gpio_num, REG_INTERRUPT_ENABLE_OFFSET);
+		cfg_byte |= (interrupt_en & 0x1u) << GPIO_CONF_SET_INT;
+
+		uint8_t interrupt_type1 = gpio_get_reg_value(gpio_num, REG_INTERRUPT_TYPE1_OFFSET);
+		cfg_byte |= (interrupt_type1 & 0x1u) << GPIO_CONF_SET_TRG_TYPE;
+
+		uint8_t interrupt_type2 = gpio_get_reg_value(gpio_num, REG_INTERRUPT_TYPE2_OFFSET);
+		if (interrupt_type2) {
+			cfg_byte |= (interrupt_type2 & 0x1u) << GPIO_CONF_SET_TRG_BOTH;
+		} else {
+			uint8_t interrupt_type0 =
+				gpio_get_reg_value(gpio_num, REG_INTERRUPT_TYPE0_OFFSET);
+			cfg_byte |= (interrupt_type0 & 0x1u) << GPIO_CONF_SET_TRG_EDGE;
+		}
+
+		msg->data[idx++] = cfg_byte;
+	}
+	free(gpio_bitmap);
+	msg->data_len = idx;
+	msg->completion_code = CC_SUCCESS;
+}
+
+void OEM_1S_SET_GPIO_CONFIG(ipmi_msg *msg)
+{
+	CHECK_NULL_ARG(msg);
+	uint8_t bitmap_len = (gpio_ind_to_num_table_cnt + BITS_PER_BYTE - 1) / BITS_PER_BYTE;
+	if (msg->data_len < bitmap_len + 1) {
+		msg->completion_code = CC_INVALID_LENGTH;
+		msg->data_len = 0;
+		return;
+	}
+
+	uint8_t idx = bitmap_len;
+	for (uint8_t num = 0; num < gpio_ind_to_num_table_cnt; num++) {
+		if (num / BITS_PER_BYTE >= bitmap_len) {
+			break;
+		}
+
+		uint8_t byte = msg->data[num / BITS_PER_BYTE];
+		uint8_t pin_mask = (uint8_t)(1u << (num % BITS_PER_BYTE));
+		if (!(byte & pin_mask)) {
+			continue;
+		}
+
+		uint8_t cfg = msg->data[idx];
+		uint8_t gpio_num = gpio_ind_to_num_table[num];
+
+		if (gpio_cfg[gpio_num].is_init == DISABLE) {
+			msg->data_len = 0;
+			msg->completion_code = CC_INVALID_DATA_FIELD;
+			return;
+		}
+
+		if (cfg & BIT(GPIO_CONF_SET_DIR)) {
+			gpio_conf(gpio_num, GPIO_OUTPUT);
+		} else {
+			gpio_conf(gpio_num, GPIO_INPUT);
+		}
+
+		if (cfg & BIT(GPIO_CONF_SET_INT)) {
+			if (cfg & BIT(GPIO_CONF_SET_TRG_BOTH)) {
+				gpio_interrupt_conf(gpio_num, GPIO_INT_EDGE_BOTH);
+			} else {
+				if (cfg & BIT(GPIO_CONF_SET_TRG_TYPE)) {
+					// level
+					if (cfg & BIT(GPIO_CONF_SET_TRG_EDGE)) {
+						gpio_interrupt_conf(gpio_num, GPIO_INT_LEVEL_HIGH);
+					} else {
+						gpio_interrupt_conf(gpio_num, GPIO_INT_LEVEL_LOW);
+					}
+				} else {
+					// edge
+					if (cfg & BIT(GPIO_CONF_SET_TRG_EDGE)) {
+						gpio_interrupt_conf(gpio_num, GPIO_INT_EDGE_RISING);
+					} else {
+						gpio_interrupt_conf(gpio_num,
+								    GPIO_INT_EDGE_FALLING);
+					}
+				}
+			}
+		} else {
+			gpio_interrupt_conf(gpio_num, GPIO_INT_DISABLE);
+		}
+
+		idx++;
+	}
+
+	msg->data_len = 0;
+	msg->completion_code = CC_SUCCESS;
+}
+
+/*
+Byte 0 - DIMM location
+  00h - A0
+  01h - A2
+  02h - A3
+  03h - A4
+  04h - A6
+  05h - A7
+Byte 1: Device type
+  00h - SPD
+  01h - SPD NVM
+  02h - PMIC
+Byte 2: Read/write data length
+Byte 3:4: 2byte offset
+Byte 5:~ write data
+*/
+void OEM_1S_WRITE_READ_DIMM(ipmi_msg *msg)
+{
+	CHECK_NULL_ARG(msg);
+
+	// At least include DIMM location, device type, write/read len, offset
+	if (msg->data_len < 4) {
+		msg->completion_code = CC_INVALID_LENGTH;
+		return;
+	}
+
+	int ret = 0;
+	uint8_t dimm_id = msg->data[0];
+	uint8_t device_type = msg->data[1];
+
+	// If host is DC on, BIC can't read DIMM information via I3C
+	// Return failed and BMC asks ME
+	if (get_DC_status()) {
+		msg->completion_code = CC_NOT_SUPP_IN_CURR_STATE;
+		return;
+	}
+
+	I3C_MSG i3c_msg = { 0 };
+	i3c_msg.bus = I3C_BUS3;
+	i3c_msg.tx_len = msg->data_len - 3;
+	i3c_msg.rx_len = msg->data[2];
+
+	// Check offset byte count: SPD_NVM has 2 bytes offset
+	if (device_type == DIMM_SPD_NVM) {
+		if (i3c_msg.tx_len < 2) {
+			msg->completion_code = CC_INVALID_DATA_FIELD;
+			return;
+		}
+	} else {
+		// One byte offset
+		if (i3c_msg.tx_len < 1) {
+			msg->completion_code = CC_INVALID_DATA_FIELD;
+			return;
+		}
+	}
+
+	memcpy(&i3c_msg.data[0], &msg->data[3], i3c_msg.tx_len);
+	msg->data_len = i3c_msg.rx_len;
+
+	if (k_mutex_lock(&i3c_dimm_mux_mutex, K_MSEC(I3C_DIMM_MUX_MUTEX_TIMEOUT_MS))) {
+		LOG_ERR("Failed to lock I3C dimm MUX");
+		msg->completion_code = CC_NODE_BUSY;
+		return;
+	}
+
+	ret = switch_i3c_dimm_mux(I3C_MUX_TO_BIC, dimm_id / (MAX_COUNT_DIMM / 2));
+	if (ret < 0) {
+		msg->completion_code = CC_UNSPECIFIED_ERROR;
+		goto exit;
+	}
+
+	// I3C_CCC_RSTDAA: Reset dynamic address assignment
+	// I3C_CCC_SETAASA: Set all addresses to static address
+	ret = all_brocast_ccc(&i3c_msg);
+	if (ret != 0) {
+		LOG_ERR("Failed to brocast CCC, ret%d bus%d", ret, i3c_msg.bus);
+		msg->completion_code = CC_UNSPECIFIED_ERROR;
+		goto exit;
+	}
+
+	switch (device_type) {
+	case DIMM_SPD:
+	case DIMM_SPD_NVM:
+		i3c_msg.target_addr = spd_i3c_addr_list[dimm_id % (MAX_COUNT_DIMM / 2)];
+
+		if (device_type == DIMM_SPD_NVM) {
+			ret = i3c_spd_reg_read(&i3c_msg, true);
+		} else {
+			ret = i3c_spd_reg_read(&i3c_msg, false);
+		}
+
+		if (ret != 0) {
+			LOG_ERR("Failed to read SPD addr0x%x offset0x%x, ret%d",
+				i3c_msg.target_addr, i3c_msg.data[0], ret);
+			msg->completion_code = CC_UNSPECIFIED_ERROR;
+		} else {
+			memcpy(&msg->data[0], &i3c_msg.data, i3c_msg.rx_len);
+			msg->data_len = i3c_msg.rx_len;
+			msg->completion_code = CC_SUCCESS;
+		}
+		break;
+
+	case DIMM_PMIC:
+		i3c_msg.target_addr = pmic_i3c_addr_list[dimm_id % (MAX_COUNT_DIMM / 2)];
+
+		ret = i3c_transfer(&i3c_msg);
+		if (ret != 0) {
+			LOG_ERR("Failed to read PMIC addr0x%x offset0x%x, ret%d bus%d",
+				i3c_msg.target_addr, i3c_msg.data[0], ret, i3c_msg.bus);
+			msg->completion_code = CC_UNSPECIFIED_ERROR;
+		} else {
+			memcpy(&msg->data[0], &i3c_msg.data, i3c_msg.rx_len);
+			msg->data_len = i3c_msg.rx_len;
+			msg->completion_code = CC_SUCCESS;
+		}
+		break;
+
+	default:
+		msg->completion_code = CC_INVALID_DATA_FIELD;
+		break;
+	}
+
+exit:
+	// Switch I3C MUX to CPU after read finish
+	switch_i3c_dimm_mux(I3C_MUX_TO_CPU, DIMM_MUX_TO_DIMM_A0A1A3);
+
+	if (k_mutex_unlock(&i3c_dimm_mux_mutex)) {
+		LOG_ERR("Failed to unlock I3C dimm MUX");
+	}
+}
+
+void OEM_1S_GET_DIMM_I3C_MUX_SELECTION(ipmi_msg *msg)
+{
+	CHECK_NULL_ARG(msg);
+
+	I2C_MSG i2c_msg = { 0 };
+	int ret = 0, retry = 3;
+
+	i2c_msg.bus = I2C_BUS1;
+	i2c_msg.target_addr = CPLD_ADDR;
+	i2c_msg.tx_len = 1;
+	i2c_msg.rx_len = 1;
+	i2c_msg.data[0] = DIMM_I3C_MUX_CONTROL_OFFSET;
+
+	ret = i2c_master_read(&i2c_msg, retry);
+	if (ret != 0) {
+		LOG_ERR("Failed to read I3C MUX status, ret=%d", ret);
+		return;
+	}
+
+	if (GETBIT(i2c_msg.data[0], 0) == I3C_MUX_TO_CPU) {
+		msg->data[0] = I3C_MUX_TO_CPU;
+	} else if (GETBIT(i2c_msg.data[0], 0) == I3C_MUX_TO_BIC) {
+		msg->data[0] = I3C_MUX_TO_BIC;
+	} else {
+		msg->completion_code = CC_UNSPECIFIED_ERROR;
+		return;
+	}
+
+	msg->completion_code = CC_SUCCESS;
+	msg->data_len = 1;
 	return;
 }
